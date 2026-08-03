@@ -94,3 +94,73 @@ Q8 remains the right lever for a *memory* problem (it would take the resident Di
 ~10 GB and open the door to a 32 GB machine). It is the wrong lever for a speed problem on 64 GB.
 
 **Quality cost: not measured — not built. Keep: no.** 20 GB of disk and an hour saved.
+
+### L3 — forward sweep 15 → 8 → 6 → 4 · **KEPT at 8, rejected below it**
+
+H3's scheduler takes `--steps` *sigma points* and runs `points - 1` forwards. All four runs use the
+same prompt, the same seed 314159 and the same 768×448 / 73-frame geometry.
+
+| Run | Forwards | Wall | s/step | Peak | Audio peak / mean | Quality |
+|---|---:|---:|---:|---:|---|---|
+| `opt_b0_fw15` | 15 | **7:39** | 27.76 | 39.63 GiB | −10.6 / −29.3 dB | reference |
+| `opt_f8` | 8 | **4:24** (1.74x) | 27.74 | 39.43 GiB | −12.9 / −32.1 dB | **none–minor** |
+| `opt_f6` | 6 | **3:28** (2.21x) | 27.74 | 39.38 GiB | −13.0 / −32.7 dB | **visible** |
+| `opt_f4` | 4 | **2:33** (3.00x) | 27.74 | 39.36 GiB | −14.6 / −33.1 dB | **visible → unacceptable** |
+
+Judged on faces at magnification (`../opt_out/grid_faces.png`) and on the prompt's hero object:
+
+* **8 forwards** holds up completely. Eyes, eyelashes, lips, teeth and skin micro-texture are all
+  present, and the mechanical butterfly renders as a structured insect with separated wings — in
+  this frame it is actually cleaner than the 15-forward render's. Composition drifts (a shorter
+  schedule is a different trajectory, not a degraded one), but nothing is lost.
+* **6 forwards** is where it starts costing: skin goes waxy, eyes lose definition, and the
+  butterfly collapses into a blue starburst rather than an object with wings.
+* **4 forwards** keeps a coherent scene and a stable face, but the face is plastic and the butterfly
+  never becomes an object at all. The clip no longer executes the prompt.
+
+The audio track quietens monotonically as forwards drop — −10.6 dB at 15 down to −14.6 dB at 4.
+That is a real cost that a purely visual review would miss, and it is why the grid prints levels.
+
+This independently reproduces the original recommendation ("eight forwards is the speed
+recommendation") on a harder prompt at a larger canvas.
+
+**Keep: 8 forwards. 1.74x, and the only lever in the campaign that pays without a visible bill.**
+
+### L4 — TeaCache-class residual/step caching · **REJECTED on measurement**
+
+Implemented in full (`minimax_h3_mlx/stepcache.py`): block-0 AdaLN-modulated input as the skip
+indicator, per-modality velocity delta as the cached residual, accumulated relative L1 against a
+threshold, first and last forwards never skipped, `max_skip` capping consecutive reuse.
+
+`--step-cache-probe` recorded the indicator's relative L1 over the full 15-step schedule without
+skipping anything, so the thresholds were chosen from the real curve rather than guessed:
+
+    step  2     3     4     5     6     7     8     9    10    11    12    13    14    15
+    rel  .033  .035  .037  .039  .042  .044  .046  .048  .049  .051  .057  .069  .100  .181
+
+The curve is the finding. Consecutive steps *never* get closer than 3.3% relative L1, and the last
+three steps move 2–5x more than the middle. TeaCache's premise — that neighbouring steps ask for
+almost the same thing — is a 40–50-step property. On a 15-step CFG-distilled schedule with sigma
+shift 12 there is simply less redundancy to harvest.
+
+Measured head-to-head at **matched wall clock**:
+
+| Run | Schedule | Real forwards | Wall | Quality vs its uniform twin |
+|---|---|---:|---:|---|
+| `opt_f8` | 8 uniform | 8 | 4:24 | — |
+| `opt_c8` | 15, threshold 0.08, skipped 2,3,5,7,9,11,13 | 8 | **4:24** | **worse** — softer skin, less defined eyes, blurrier wings |
+| `opt_f6` | 6 uniform | 6 | 3:28 | — |
+| `opt_c6` | 15, threshold 0.12, skipped 2,3,5,6,8,9,11,12,14 | 6 | **3:29** | a wash — better butterfly, same waxy face |
+
+At 8 effective forwards, uniform steps beat step reuse clearly (`../opt_out/grid_stepcache_faces.png`).
+At 6 it is a tie. Reuse never wins, so a correct implementation of a well-known 1.5–2x lever earns
+no place in the stack — the trivial alternative dominates it on this schedule.
+
+The mechanism is honest and boring: reusing a delta across a step where the trajectory genuinely
+moved is a worse approximation than taking one properly spaced Euler step in the first place.
+
+Cost when enabled: the indicator probe adds ~0.6% per step (27.76 vs 27.59 s/step) because it
+rebuilds the packed input and forces a host sync for the L1 reduction.
+
+**Keep: no.** The code stays in the tree behind a default-off flag — it would become the right
+lever the moment a longer, less distilled schedule is used.
