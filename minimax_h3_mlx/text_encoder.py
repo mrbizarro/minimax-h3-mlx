@@ -26,7 +26,9 @@ import json
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
+from safetensors import safe_open
 
 from .config import TAG_TEXT, TAG_VIDEO
 from .packing import TEXT_ENCODER_LAYER
@@ -42,13 +44,14 @@ class MiniMaxH3TextEncoder:
         dtype: mx.Dtype = mx.bfloat16,
         load_vision: bool = True,
         verbose: bool = False,
+        config_path: str | Path | None = None,
     ):
         from mlx_vlm.models.qwen3_vl.config import ModelConfig, TextConfig, VisionConfig
         from mlx_vlm.models.qwen3_vl.language import Qwen3VLModel
         from mlx_vlm.models.qwen3_vl.vision import VisionModel
 
         model_dir = Path(model_dir)
-        with open(model_dir / "config.json") as fh:
+        with open(config_path or (model_dir / "config.json")) as fh:
             raw = json.load(fh)
 
         full_layers = raw["text_config"]["num_hidden_layers"]
@@ -94,7 +97,7 @@ class MiniMaxH3TextEncoder:
 
     # -- loading ---------------------------------------------------------------------------
 
-    def _wanted(self, key: str) -> str | None:
+    def _wanted(self, key: str) -> tuple[str, str] | None:
         """Map a checkpoint key onto this module's parameter path, or ``None`` to skip it."""
         if key.startswith("lm_head"):
             return None  # never evaluated
@@ -111,20 +114,61 @@ class MiniMaxH3TextEncoder:
             if self.vision is None:
                 return None
             return ("vision", key[len("model.visual.") :])
+        # ddalcu's compact MLX export removes the upstream wrappers while retaining the exact
+        # module names below them.
+        if key.startswith("model."):
+            rest = key[len("model.") :]
+            if rest.startswith("layers."):
+                index = int(rest.split(".")[1])
+                if index >= self.num_layers:
+                    return None
+            return ("language", rest)
+        if key.startswith("visual."):
+            if self.vision is None:
+                return None
+            return ("vision", key[len("visual.") :])
         return None
 
     def _load_weights(self, model_dir: Path, dtype: mx.Dtype, verbose: bool) -> None:
         from mlx.utils import tree_flatten, tree_unflatten
 
-        shards = sorted(glob.glob(str(model_dir / "*.safetensors")))
+        compact = model_dir / "text_encoder.safetensors"
+        shards = [str(compact)] if compact.exists() else sorted(glob.glob(str(model_dir / "*.safetensors")))
         if not shards:
             raise FileNotFoundError(f"No safetensors in {model_dir}.")
+
+        # Replay the compact export's quantized module structure before calculating expected keys.
+        # A sibling ``.scales`` tensor is an unambiguous marker for MLX affine quantization.
+        quantized: dict[str, set[str]] = {"language": set(), "vision": set()}
+        for shard in shards:
+            with safe_open(shard, framework="np") as handle:
+                for key in handle.keys():
+                    if not key.endswith(".scales"):
+                        continue
+                    target = self._wanted(key)
+                    if target is not None:
+                        bucket, path = target
+                        quantized[bucket].add(path[: -len(".scales")])
+
+        for bucket, module in (("language", self.language), ("vision", self.vision)):
+            if module is not None and quantized[bucket]:
+                targets = quantized[bucket]
+                nn.quantize(
+                    module,
+                    group_size=64,
+                    bits=8,
+                    mode="affine",
+                    class_predicate=lambda path, _module, targets=targets: path in targets,
+                )
 
         buckets: dict[str, dict[str, mx.array]] = {"language": {}, "vision": {}}
         expected = {
             "language": {k for k, _ in tree_flatten(self.language.parameters())},
             "vision": set() if self.vision is None else {k for k, _ in tree_flatten(self.vision.parameters())},
         }
+        # Compact H3 exports omit the final language norm because conditioning is read before it.
+        # The module retains its tiny initialized norm for mlx-vlm structural compatibility.
+        expected["language"].discard("norm.weight")
         skipped = 0
         for shard in shards:
             for key, tensor in mx.load(shard).items():
@@ -136,7 +180,9 @@ class MiniMaxH3TextEncoder:
                 if path not in expected[bucket]:
                     skipped += 1
                     continue
-                buckets[bucket][path] = tensor.astype(dtype)
+                # Packed MLX weights are uint32 storage. Casting those would silently destroy the
+                # checkpoint; floating weights and quantization metadata follow the requested dtype.
+                buckets[bucket][path] = tensor if tensor.dtype == mx.uint32 else tensor.astype(dtype)
             if verbose:
                 print(f"  {Path(shard).name}: kept {len(buckets['language']) + len(buckets['vision'])}")
 
@@ -163,7 +209,9 @@ class MiniMaxH3TextEncoder:
 
             root = self._model_dir.parent
             path = root / "tokenizer" if (root / "tokenizer").exists() else self._model_dir
-            self._tokenizer = AutoTokenizer.from_pretrained(str(path))
+            # Current transformers detects the legacy Mistral/Qwen pre-tokenizer regex embedded in
+            # this tokenizer and otherwise warns that whitespace/punctuation can split incorrectly.
+            self._tokenizer = AutoTokenizer.from_pretrained(str(path), fix_mistral_regex=True)
         return self._tokenizer
 
     @property

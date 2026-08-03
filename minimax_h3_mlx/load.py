@@ -19,6 +19,7 @@ from pathlib import Path
 
 import mlx.core as mx
 from mlx.utils import tree_flatten, tree_unflatten
+from safetensors import safe_open
 
 from .config import DiTConfig
 from .dit import MiniMaxH3DiT
@@ -43,6 +44,8 @@ def is_fp32_key(key: str) -> bool:
 def shard_paths(model_dir: str | Path) -> list[Path]:
     """Resolve the safetensors shards of a transformer directory, in index order."""
     model_dir = Path(model_dir)
+    if model_dir.is_file():
+        return [model_dir]
     index_path = model_dir / "model.safetensors.index.json"
     if index_path.exists():
         with open(index_path) as fh:
@@ -53,6 +56,19 @@ def shard_paths(model_dir: str | Path) -> list[Path]:
     if not shards:
         raise FileNotFoundError(f"No safetensors found in {model_dir}.")
     return shards
+
+
+def safetensor_metadata(path: str | Path) -> dict[str, str]:
+    """Read a safetensors header without mapping the tensor payload."""
+    with safe_open(str(path), framework="np") as handle:
+        return handle.metadata() or {}
+
+
+def _metadata_json(metadata: dict[str, str], key: str) -> dict:
+    value = metadata.get(key)
+    if value is None:
+        raise KeyError(f"Safetensors metadata has no {key!r} entry.")
+    return json.loads(value)
 
 
 def load_dit(
@@ -74,13 +90,26 @@ def load_dit(
         A parameter-loaded :class:`MiniMaxH3DiT`.
     """
     model_dir = Path(model_dir)
-    config = DiTConfig.from_json(model_dir / "config.json")
+    if model_dir.is_file():
+        # Pruned checkpoints encode AdaLN as a sampled low-rank curve. The tensor shapes are the
+        # authoritative configuration because these single-file exports intentionally omit the
+        # original transformer's config directory.
+        with safe_open(str(model_dir), framework="np") as handle:
+            keys = set(handle.keys())
+            if "adaln_t_table" not in keys:
+                raise KeyError(
+                    "Single-file DiT checkpoints must contain the pruned 'adaln_t_table' tensor."
+                )
+            grid, rank = handle.get_slice("adaln_t_table").get_shape()
+        config = DiTConfig(time_embed_dim=rank, adaln_curve_grid=grid)
+    else:
+        config = DiTConfig.from_json(model_dir / "config.json")
     model = MiniMaxH3DiT(config)
 
     # A quantized build carries `quant_config.json`. Quantized layers hold packed weights plus
     # scales and biases, so the module tree has to be quantized *before* loading or the keys will
     # not line up — the same recipe is replayed from the file rather than guessed.
-    quant_path = model_dir / "quant_config.json"
+    quant_path = model_dir / "quant_config.json" if model_dir.is_dir() else Path("/__missing__")
     if quant_path.exists():
         from .quantize import QuantConfig, apply_quantization_structure
 
@@ -174,7 +203,7 @@ def load_video_vae(model_dir: str | Path, strict: bool = True):
     unexpected: list[str] = []
     for key, tensor in mx.load(str(model_dir / "source" / "model.safetensors")).items():
         # An all-zero buffer of the masked-autoencoding objective; the decoder never reads it.
-        if key == "decoder.mask_token":
+        if key in ("decoder.mask_token", "latents_mean", "latents_std"):
             continue
         if key not in expected:
             unexpected.append(key)
@@ -190,6 +219,59 @@ def load_video_vae(model_dir: str | Path, strict: bool = True):
     if strict and (missing or unexpected):
         raise KeyError(
             f"Video VAE mismatch: {len(missing)} missing (e.g. {missing[:4]}), "
+            f"{len(unexpected)} unexpected (e.g. {unexpected[:4]})."
+        )
+    model.update(tree_unflatten(list(weights.items())))
+    mx.eval(model.parameters())
+    return model
+
+
+def load_compact_video_vae(path: str | Path, strict: bool = True):
+    """Load ddalcu's self-describing single-file video VAE export."""
+    from .video_vae import VideoVAE, VideoVAEConfig
+
+    path = Path(path)
+    wrapper = _metadata_json(safetensor_metadata(path), "minimax_h3_video_vae")
+    source = wrapper["source_config"]
+    ch = source["ch"]
+    config = VideoVAEConfig(
+        in_channels=source["in_channels"],
+        out_channels=source["out_ch"],
+        latent_channels=source["z_channels"],
+        block_out_channels=tuple(ch * m for m in source["ch_mult"]),
+        layers_per_block=source["num_res_blocks"],
+        spatial_downsample_factors=tuple(source["space_down"]),
+        temporal_downsample_factors=tuple(source["time_down"]),
+        decoder_num_layers=source["vit_decoder_kwargs"]["num_layers"],
+        decoder_num_attention_heads=source["vit_decoder_kwargs"]["heads"],
+        decoder_attention_head_dim=source["vit_decoder_kwargs"]["dim_head"],
+        decoder_rope_theta=source["vit_decoder_kwargs"]["rope_theta"],
+        decoder_rope_dim_ratio=source["vit_decoder_kwargs"]["rope_dim_ratio"],
+        clip_length=wrapper.get("vae_clip_length", 17),
+        token_drop=wrapper.get("vae_token_drop", 3),
+        latents_mean=tuple(wrapper["latents_mean"]),
+        latents_std=tuple(wrapper["latents_std"]),
+    )
+    model = VideoVAE(config)
+    expected = {key for key, _ in tree_flatten(model.parameters())}
+    weights: dict[str, mx.array] = {}
+    unexpected: list[str] = []
+
+    for key, tensor in mx.load(str(path)).items():
+        if key in ("decoder.mask_token", "latents_mean", "latents_std"):
+            continue
+        if key not in expected:
+            unexpected.append(key)
+            continue
+        if tensor.ndim == 5:
+            tensor = mx.contiguous(tensor.transpose(0, 2, 3, 4, 1))
+            mx.eval(tensor)
+        weights[key] = tensor
+
+    missing = sorted(expected - weights.keys())
+    if strict and (missing or unexpected):
+        raise KeyError(
+            f"Compact video VAE mismatch: {len(missing)} missing (e.g. {missing[:4]}), "
             f"{len(unexpected)} unexpected (e.g. {unexpected[:4]})."
         )
     model.update(tree_unflatten(list(weights.items())))
@@ -232,7 +314,7 @@ def load_audio_vae(model_dir: str | Path, strict: bool = True):
     unexpected: list[str] = []
 
     for key, tensor in raw.items():
-        if key.endswith(".filter"):
+        if key.endswith(".filter") or key in ("latents_mean", "latents_std"):
             continue  # recomputed by kaiser_sinc_filter1d
         if key.endswith(".weight_v"):
             base = key[: -len("_v")]
@@ -260,6 +342,52 @@ def load_audio_vae(model_dir: str | Path, strict: bool = True):
     if strict and (missing or unexpected):
         raise KeyError(
             f"Audio VAE mismatch: {len(missing)} missing (e.g. {missing[:4]}), "
+            f"{len(unexpected)} unexpected (e.g. {unexpected[:4]})."
+        )
+    model.update(tree_unflatten(list(weights.items())))
+    mx.eval(model.parameters())
+    return model
+
+
+def load_compact_audio_vae(path: str | Path, strict: bool = True):
+    """Load ddalcu's single-file audio VAE, whose weight norm is already folded."""
+    from .audio_vae import AudioVAE, AudioVAEConfig
+
+    path = Path(path)
+    wrapper = _metadata_json(safetensor_metadata(path), "minimax_h3_audio_vae")
+    kwargs = wrapper["kwargs"]
+    config = AudioVAEConfig(
+        encoder_dim=kwargs["encoder_dim"],
+        encoder_rates=tuple(kwargs["encoder_rates"]),
+        latent_dim=kwargs["latent_dim"],
+        latent_channels=kwargs["vae_latent_channels"],
+        decoder_dim=kwargs["decoder_dim"],
+        decoder_rates=tuple(kwargs["decoder_rates"]),
+        sampling_rate=kwargs["sample_rate"],
+        latents_mean=tuple(wrapper["latents_mean"]),
+        latents_std=tuple(wrapper["latents_std"]),
+    )
+    model = AudioVAE(config)
+    expected = {key for key, _ in tree_flatten(model.parameters())}
+    weights: dict[str, mx.array] = {}
+    unexpected: list[str] = []
+
+    for key, tensor in mx.load(str(path)).items():
+        if key.endswith(".filter") or key in ("latents_mean", "latents_std"):
+            continue
+        if key not in expected:
+            unexpected.append(key)
+            continue
+        if key.endswith(".weight") and tensor.ndim == 3:
+            tensor = tensor.transpose(1, 2, 0) if ".ups." in key else tensor.transpose(0, 2, 1)
+        elif key.endswith(".alpha") and tensor.ndim == 3:
+            tensor = tensor.transpose(0, 2, 1)
+        weights[key] = tensor
+
+    missing = sorted(expected - weights.keys())
+    if strict and (missing or unexpected):
+        raise KeyError(
+            f"Compact audio VAE mismatch: {len(missing)} missing (e.g. {missing[:4]}), "
             f"{len(unexpected)} unexpected (e.g. {unexpected[:4]})."
         )
     model.update(tree_unflatten(list(weights.items())))
