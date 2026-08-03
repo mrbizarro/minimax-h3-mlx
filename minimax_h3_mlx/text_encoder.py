@@ -194,7 +194,15 @@ class MiniMaxH3TextEncoder:
                 raise KeyError(
                     f"{bucket} encoder missing {len(missing)} tensors, e.g. {missing[:4]}."
                 )
-            module.update(tree_unflatten(list(buckets[bucket].items())))
+            # mlx-vlm's own layout fixes, chiefly the patch-embed convolution: PyTorch stores it
+            # as (out, in, t, h, w) and MLX's conv3d wants (out, t, h, w, in). Loading the bucket
+            # raw leaves a transposed kernel that only fails once an image is actually encoded,
+            # which is why a text-only path never hit it.
+            weights = buckets[bucket]
+            sanitize = getattr(module, "sanitize", None)
+            if sanitize is not None:
+                weights = sanitize(weights)
+            module.update(tree_unflatten(list(weights.items())))
         mx.eval(self.language.parameters())
         if self.vision is not None:
             mx.eval(self.vision.parameters())
@@ -219,8 +227,42 @@ class MiniMaxH3TextEncoder:
         if self._processor is None:
             from transformers import AutoProcessor
 
-            self._processor = AutoProcessor.from_pretrained(str(self._model_dir.parent / "processor"))
+            directory = self._model_dir.parent / "processor"
+            if directory.exists():
+                self._processor = AutoProcessor.from_pretrained(str(directory))
+            else:
+                self._processor = _FallbackProcessor(self._build_image_processor())
         return self._processor
+
+    def _build_image_processor(self):
+        """Construct Qwen3-VL's image processor from ``vision_config`` alone.
+
+        A compact single-file export carries the weights and the model config but not the upstream
+        ``processor/`` directory, and the geometry the processor needs — ``patch_size``,
+        ``spatial_merge_size``, ``temporal_patch_size`` — is all present in ``vision_config``.
+        Qwen3-VL reuses Qwen2-VL's dynamic-resolution image processor, so the class is the same.
+
+        The only values not derivable from the config are the CLIP normalization statistics, which
+        are fixed across the Qwen-VL family, and the pixel budget. The budget is deliberately left
+        wide here: keyframes are handed to :meth:`encode` already resized onto the render canvas,
+        whose axes are multiples of 32 and therefore survive ``smart_resize`` untouched — one
+        vision token per merged 32x32 block, matching the canvas the VAE encodes.
+        """
+        from transformers import Qwen2VLImageProcessor
+
+        return Qwen2VLImageProcessor(
+            patch_size=self.vision_config.patch_size,
+            merge_size=self.vision_config.spatial_merge_size,
+            temporal_patch_size=self.vision_config.temporal_patch_size,
+            image_mean=[0.48145466, 0.4578275, 0.40821073],
+            image_std=[0.26862954, 0.26130258, 0.27577711],
+            min_pixels=32 * 32 * 4,
+            max_pixels=32 * 32 * 16384,
+            do_resize=True,
+            do_rescale=True,
+            do_normalize=True,
+            do_convert_rgb=True,
+        )
 
     # -- request presentation --------------------------------------------------------------
 
@@ -314,7 +356,19 @@ class MiniMaxH3TextEncoder:
             )
             inputs_embeds = self.language.embed_tokens(input_ids)
             image_mask = input_ids == self.image_token_id
-            inputs_embeds = mx.where(image_mask[..., None], hidden.astype(inputs_embeds.dtype)[None], inputs_embeds)
+            # The vision tower emits one row per *merged* patch, not one per request token, so the
+            # rows have to be scattered into the `<|image_pad|>` positions. A `where` cannot do it:
+            # its operands would have to broadcast, and (1, num_patches, 5120) does not broadcast
+            # against (1, sequence_length, 5120) for any request that carries prompt text as well.
+            expanded = mx.broadcast_to(image_mask[..., None], inputs_embeds.shape)
+            image_features = hidden.astype(inputs_embeds.dtype)
+            if int(expanded.sum().item()) != image_features.size:
+                raise ValueError(
+                    f"The request reserves {int(image_mask.sum().item())} image rows but the "
+                    f"vision tower produced {image_features.shape[0]}. The image processor's "
+                    "patch geometry and the vision config disagree."
+                )
+            inputs_embeds = _masked_scatter(inputs_embeds, expanded, image_features)
             visual_pos_masks = image_mask
 
         # Qwen3-VL's 3D M-RoPE index, derived from the vision-start/pad token ids.
@@ -336,3 +390,23 @@ class MiniMaxH3TextEncoder:
     @property
     def config(self):
         return self.model_config
+
+
+class _FallbackProcessor:
+    """The single attribute :meth:`build_request` needs, when no upstream processor dir exists."""
+
+    def __init__(self, image_processor):
+        self.image_processor = image_processor
+
+
+def _masked_scatter(target: mx.array, mask: mx.array, values: mx.array) -> mx.array:
+    """Write ``values`` into the ``True`` positions of ``mask``, in flattened order.
+
+    The same operation mlx-vlm performs when merging vision rows into a Qwen3-VL request; kept
+    local so this module does not depend on a private helper of theirs.
+    """
+    shape = target.shape
+    flat = mx.flatten(target)
+    positions = mx.array(np.where(np.array(mx.flatten(mask)))[0], mx.uint32)
+    flat[positions] = mx.flatten(values)
+    return mx.reshape(flat, shape)

@@ -231,7 +231,19 @@ def main() -> int:
         if args.first_frame is not None:
             from PIL import Image
 
-            keyframes = [Image.open(args.first_frame).convert("RGB")]
+            from minimax_h3_mlx.packing import prepare_keyframe_image
+
+            # Put the still on the render canvas once, before either encoder sees it. The VAE would
+            # do this anyway; doing it up front also means the vision tower's `smart_resize` is a
+            # no-op on axes that are already multiples of 32, so both encoders read the same pixels.
+            keyframes = [
+                prepare_keyframe_image(
+                    Image.open(args.first_frame).convert("RGB"),
+                    args.height,
+                    args.width,
+                    stretch=True,
+                )
+            ]
 
         if args.prompt_cache is not None and args.prompt_cache.exists():
             with record.phase("text_cache_load"):
