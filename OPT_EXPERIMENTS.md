@@ -164,3 +164,110 @@ rebuilds the packed input and forces a host sync for the L1 reduction.
 
 **Keep: no.** The code stays in the tree behind a default-off flag — it would become the right
 lever the moment a longer, less distilled schedule is used.
+
+### L6 — half temporal density + interpolation · **REJECTED for a joint audio-video model**
+
+Generate at half the frame density, write the clip at half the frame rate, interpolate back to 24
+fps. Packed rows fall roughly in half, so the linear half of the cost halves and the quadratic half
+quarters — by far the largest speed lever available.
+
+| Run | Frames / playback | Clip length | Rows | s/step | Wall |
+|---|---|---:|---:|---:|---:|
+| `opt_f8` | 73 @ 24 fps | 3.04 s | 7,689 | 27.74 | **4:24** |
+| `opt_half39` | 39 @ 12 fps | 3.19 s | 4,298 | 13.84 | **2:18** (1.91x) |
+
+Per-frame image quality is genuinely fine — the astronaut is coherent, the butterfly is a properly
+formed insect, the grade is clean (`../opt_out/grid_halfdensity.png`). The lever fails on the two
+things that are not single frames:
+
+* **Audio.** −20.2 dB peak / −34.3 dB mean, against −12.9 / −32.1 for the full-density run at the
+  same forward count. H3 generates audio on a 40 latent/s clock locked to the video's rotary clock,
+  so halving temporal density halves the audio the model produces, and covering the clip then needs
+  a 2x `atempo` stretch. Speech is exactly what a 2x stretch damages most. For a model whose whole
+  point is *joint* audio and video, this is not a small bill.
+* **Motion cadence.** The model fills the rotary span it is given. 39 frames is 1.63 s of intended
+  action; playing it over 3.19 s means everything happens at half speed, and the frames between are
+  `minterpolate`'s guesses rather than the model's. On a slow push-in it can pass as deliberate
+  slow motion; on the prompt's kneel-and-release beat it reads as a different shot.
+
+**Quality cost: visible (motion cadence) to unacceptable (dialogue). Keep: no.** It is reported
+because it is the only route to a sub-5-minute ten-second clip — see `OPT_VERDICT.md`. If a shot
+has no dialogue and wants slow motion anyway, it is a legitimate 1.9x.
+
+### L7 — the stack
+
+Exactly one lever survived its quality gate: **8 forwards instead of 15**. Everything else was
+either refuted by measurement before it cost a render (L1, L2, L5), rejected on a matched-cost
+head-to-head (L4), or rejected on quality (L3 below 8, L6).
+
+There is nothing to stack, so the hero run is the single kept lever applied to the 10-second config.
+
+### L7 result — the 10-second hero, and the finding that reframes the campaign
+
+`opt_hero243_fw8`: 768×448, 243 frames (10.13 s), **8 forwards**, seed 314159, same prompt as the
+36:12 baseline.
+
+| | Baseline | Hero (8 fw) |
+|---|---:|---:|
+| Wall clock | 36:12.107 | **21:01.741** |
+| Speedup | — | **1.72x** |
+| s/step | 137.183 | 143.28 |
+| Packed rows | 25,138 | 25,138 |
+| Peak Metal | 42.635 GiB | 42.520 GiB |
+| Audio peak / mean | −17.5 / −38.2 dB | −18.9 / −40.5 dB |
+
+The 143.28 s/step is 4.4% above the baseline's 137.183 for the same geometry, and drifts upward
+within the run (142.8 → 144.5). A `bench_block` re-run immediately afterwards came back at
+551.8 ms against 549.0 ms at the start of the campaign — only 0.5% — so short bursts are not
+throttled and this is sustained-load behaviour specific to a 144-second continuous full-occupancy
+step, after two hours of back-to-back rendering. Normalized to the baseline's own s/step the run
+would be **20:13**. The measured 21:01 is reported as the headline.
+
+**But the hero does not clear its quality gate.** For the first ~2.2 seconds the 8-forward render
+shows **two astronauts** where the prompt asks for one and the baseline renders one
+(`../opt_out/grid_hero_open.png`). They merge into a single subject by ~2.5 s and the rest of the
+clip is coherent, but a fifth of the shot has a duplicated protagonist. The mechanical butterfly
+also never resolves into an object, staying a blue feathery smear where the baseline produces
+structured wings.
+
+This is the campaign's most useful result and it was invisible at the iteration config:
+
+> **The safe forward count is not scale-invariant.** Eight forwards graded *none–minor* at 73
+> frames / 7,689 rows and *visible* at 243 frames / 25,138 rows. A longer packed sequence is a
+> harder denoising problem — more rows, more temporal structure to resolve — and it needs more of
+> the schedule to resolve subject count and object identity.
+
+Iterating a step-count lever on a cheap config and extrapolating it to an expensive one is exactly
+the mistake this campaign was structured to avoid, and it still nearly happened. The lever must be
+re-gated at every duration.
+
+**Quality cost at 10 seconds: visible. Keep at 10 seconds: no.**
+
+### L7 follow-up — where the boundary actually is
+
+If 8 forwards is safe at 7,689 rows and unsafe at 25,138, the interesting question is the 5-second
+tier in between. `opt_5s124_fw8`: 768×448, 124 frames (5.17 s), 8 forwards, seed 314159.
+
+| | Baseline 15 fw | 8 fw |
+|---|---:|---:|
+| Wall clock | 14:38.669 | **8:19** |
+| Speedup | — | **1.76x** |
+| s/step | 53.705 | 54.401 |
+| Packed rows | 12,982 | 12,982 |
+| Peak Metal | 40.221 GiB | 40.10 GiB |
+| Audio peak / mean | −16.4 / −36.5 dB | **−14.6 / −36.0 dB** |
+
+Clean (`../opt_out/grid_5s.png`): one astronaut throughout, faces defined and expressive, the
+butterfly resolves into a structured winged object in the closing frames, and the audio is actually
+*louder* than the 15-forward baseline. **Quality cost: none–minor. Keep: yes.**
+
+So the boundary sits between 12,982 and 25,138 packed rows:
+
+| Duration | Rows | 8 forwards |
+|---|---:|---|
+| 3.04 s | 7,689 | safe |
+| 5.17 s | 12,982 | safe |
+| 10.13 s | 25,138 | **not safe** — duplicated subject, unresolved hero object |
+
+**The recommendation is therefore duration-dependent, not global: 8 forwards up to ~5 seconds,
+the full 15 beyond it until an intermediate count is gated.**
