@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import mlx.core as mx
@@ -124,6 +125,43 @@ def test_schedule_timesteps():
     print(f"schedule timesteps: {ts.tolist()}")
 
 
+def test_pruned_adaln_curve_forward_and_cache():
+    """Pruned checkpoints interpolate the curve and bypass both timestep SiLU stages."""
+    cfg = replace(tiny_config(), time_embed_dim=8, adaln_curve_grid=5)
+    mx.random.seed(3)
+    dit = MiniMaxH3DiT(cfg)
+    table = mx.arange(40, dtype=mx.float32).reshape(5, 8)
+    dit.adaln_t_table = table
+    mx.eval(dit.parameters())
+
+    interpolated = dit.embed_timesteps(mx.array([0.0, 0.125, 1.0]))
+    expected = mx.stack([table[0], (table[0] + table[1]) / 2, table[-1]])
+    mx.eval(interpolated)
+    assert float(mx.max(mx.abs(interpolated - expected)).item()) == 0.0
+
+    n_text, n_video, n_audio = 5, 9, 3
+    text_i, video_i, audio_i, tags, ts_i, pos = build_packed_layout(n_text, n_video, n_audio)
+    args = (
+        mx.random.normal((1, n_video, cfg.video_patch_dim)),
+        mx.random.normal((1, n_audio, cfg.audio_latents_dim)),
+        mx.random.normal((1, n_text, cfg.text_dim)),
+        mx.array([0.0, 0.7]),
+        ts_i,
+        tags,
+        pos,
+        video_i,
+        audio_i,
+        text_i,
+    )
+    live_v, live_a = dit(*args)
+    cache = ModulationCache.build(dit, args[3], dtype=mx.float32)
+    cached_v, cached_a = dit(*args, modulation_cache=cache)
+    mx.eval(live_v, live_a, cached_v, cached_a)
+    assert float(mx.max(mx.abs(live_v - cached_v)).item()) == 0.0
+    assert float(mx.max(mx.abs(live_a - cached_a)).item()) == 0.0
+    print("pruned AdaLN curve interpolation and cached forward ok")
+
+
 def _flatten(tree, prefix=""):
     if isinstance(tree, dict):
         for k, v in tree.items():
@@ -137,5 +175,6 @@ def _flatten(tree, prefix=""):
 
 if __name__ == "__main__":
     test_schedule_timesteps()
+    test_pruned_adaln_curve_forward_and_cache()
     test_modulation_cache_matches_live_projection()
     print("\nall smoke tests passed")

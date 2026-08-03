@@ -26,7 +26,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .config import MODALITY_NUM
-from .dit import timestep_embedding
+from .dit import param_dtype
 
 
 class ModulationCache:
@@ -66,7 +66,7 @@ class ModulationCache:
             dtype: storage dtype of the cache. bfloat16 halves the footprint and matches the
                 precision the modulation is consumed at inside the block stack.
         """
-        temb = dit.time_embedder(timestep_embedding(timesteps, dit.config.timestep_input_dim))
+        temb = dit.embed_timesteps(timesteps)
         mx.eval(temb)
 
         tables: list[tuple[mx.array, ...]] = []
@@ -83,9 +83,10 @@ def final_layer_modulation(dit, timesteps: mx.array, dtype: mx.Dtype = mx.bfloat
     ``final_layer.adaln_proj`` is only ``[10752, 2688]`` (~29M params), so caching it is about
     avoiding a redundant projection per step rather than about memory.
     """
-    temb = dit.time_embedder(timestep_embedding(timesteps, dit.config.timestep_input_dim))
+    temb = dit.embed_timesteps(timesteps)
     linear = dit.final_layer.adaln_proj.linear
-    h = linear(nn.silu(temb).astype(linear.weight.dtype))
+    h = nn.silu(temb) if dit.final_layer.adaln_proj.apply_silu else temb
+    h = linear(h.astype(param_dtype(linear)))
     hidden = dit.config.hidden_size
     shift, scale = h[..., :hidden], h[..., hidden:]
     shift, scale = shift.astype(dtype), scale.astype(dtype)

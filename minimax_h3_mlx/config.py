@@ -50,6 +50,9 @@ class DiTConfig:
     norm_eps: float = 1e-5
     qk_norm_eps: float = 1e-5
     final_norm_eps: float = 1e-5
+    # Pruned inference checkpoints replace the enormous per-block timestep MLP input with a
+    # low-rank curve sampled on a fixed grid. ``None`` is the original checkpoint layout.
+    adaln_curve_grid: int | None = None
 
     @property
     def inner_dim(self) -> int:

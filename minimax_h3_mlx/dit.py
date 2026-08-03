@@ -196,11 +196,13 @@ class AdaLayerNormModulation(nn.Module):
     def __init__(self, config: DiTConfig):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.apply_silu = config.adaln_curve_grid is None
         self.linear = nn.Linear(config.time_embed_dim, config.adaln_out_features, bias=True)
 
     def __call__(self, temb: mx.array) -> tuple[mx.array, ...]:
         # Activate at `temb`'s own (float32) precision, cast to the projection's dtype after.
-        h = nn.silu(temb).astype(param_dtype(self.linear))
+        h = nn.silu(temb) if self.apply_silu else temb
+        h = h.astype(param_dtype(self.linear))
         h = self.linear(h).reshape(-1, 6 * self.hidden_size)
         return tuple(h[..., i * self.hidden_size : (i + 1) * self.hidden_size] for i in range(6))
 
@@ -210,6 +212,7 @@ class AdaLayerNormModulationOut(nn.Module):
 
     def __init__(self, config: DiTConfig):
         super().__init__()
+        self.apply_silu = config.adaln_curve_grid is None
         self.linear = nn.Linear(config.time_embed_dim, config.final_adaln_out_features, bias=True)
 
 
@@ -229,7 +232,8 @@ class FinalLayer(nn.Module):
         self.hidden_size = config.hidden_size
 
     def norm_out(self, x: mx.array, temb: mx.array, timestep_indices: mx.array) -> mx.array:
-        h = self.adaln_proj.linear(nn.silu(temb).astype(param_dtype(self.adaln_proj.linear)))
+        h = nn.silu(temb) if self.adaln_proj.apply_silu else temb
+        h = self.adaln_proj.linear(h.astype(param_dtype(self.adaln_proj.linear)))
         shift, scale = h[..., : self.hidden_size], h[..., self.hidden_size :]
         x = self.norm(x)
         return x * (1.0 + scale[timestep_indices]) + shift[timestep_indices]
@@ -308,8 +312,14 @@ class MiniMaxH3DiT(nn.Module):
         self.audio_patch_proj = nn.Linear(config.audio_latents_dim, config.hidden_size, bias=True)
         self.condition_proj = nn.Linear(config.text_dim, config.hidden_size, bias=True)
 
-        # 2. Timestep embedding, shared by every AdaLN projection.
-        self.time_embedder = TimestepEmbedder(config)
+        # 2. Timestep embedding, shared by every AdaLN projection. Pruned inference checkpoints
+        #    carry a sampled low-rank curve instead of the original 13B-parameter projection path.
+        if config.adaln_curve_grid is None:
+            self.time_embedder = TimestepEmbedder(config)
+        else:
+            self.adaln_t_table = mx.zeros(
+                (config.adaln_curve_grid, config.time_embed_dim), dtype=mx.float32
+            )
 
         # 3. Text stream refiner.
         self.token_refiner = TokenRefiner(config)
@@ -323,6 +333,19 @@ class MiniMaxH3DiT(nn.Module):
 
         # Rotary is a computed buffer, not a parameter (`rope.inv_freq` is recomputed bit-exactly).
         self.rope = RotaryPosEmbed3D(config)
+
+    def embed_timesteps(self, timesteps: mx.array) -> mx.array:
+        """Return original MLP embeddings or linearly interpolated pruned AdaLN coordinates."""
+        if self.config.adaln_curve_grid is None:
+            return self.time_embedder(
+                timestep_embedding(timesteps, self.config.timestep_input_dim)
+            )
+
+        grid = self.config.adaln_curve_grid
+        position = mx.clip(timesteps.astype(mx.float32), 0.0, 1.0) * (grid - 1)
+        lower = mx.minimum(mx.floor(position).astype(mx.int32), grid - 2)
+        fraction = (position - lower.astype(mx.float32))[:, None]
+        return self.adaln_t_table[lower] * (1.0 - fraction) + self.adaln_t_table[lower + 1] * fraction
 
     def __call__(
         self,
@@ -382,7 +405,7 @@ class MiniMaxH3DiT(nn.Module):
         x[:, audio_indices] = audio_embeds.astype(text.dtype)
 
         # 2. One timestep embedding per distinct noise level, shared by all AdaLN projections.
-        temb = self.time_embedder(timestep_embedding(timestep, self.config.timestep_input_dim))
+        temb = self.embed_timesteps(timestep)
 
         # 3. Row -> AdaLN table row. `maximum(tags, 0)` mirrors the reference clamp: padding rows
         #    carry tag -1 and must not index backwards. They never reach the outputs.
