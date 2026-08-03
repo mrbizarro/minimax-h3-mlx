@@ -42,6 +42,61 @@ from .packing import (
 from .scheduler import MiniMaxH3Scheduler
 
 
+def encode_keyframe_rows(
+    video_vae,
+    images: list,
+    height: int,
+    width: int,
+    patch_size: tuple[int, int, int],
+) -> mx.array:
+    """Encode ``fl2va`` keyframes into packed conditioning rows.
+
+    Module-level so a staged runner — which only ever holds one large model at a time and therefore
+    cannot construct a whole :class:`MiniMaxH3Pipeline` — can encode a first frame with just the
+    video VAE resident.
+
+    Keyframes are single frames, so they go through the video VAE's **spatial** encoder only —
+    none of its 17-frame temporal chunking applies. Two details of the reference are load-bearing
+    and easy to miss:
+
+    * the posterior is **sampled**, not taken at its mode, under a generator seeded with 42
+      independently of the request seed;
+    * the sampled latent is **rounded through float16** before normalization, which is about 11
+      bits of every conditioning latent — the released model's conditioning cannot be reproduced
+      without it.
+
+    MLX's RNG differs from torch's, so the seed-42 draw is not bit-identical to the reference's;
+    the distribution and every other step are.
+    """
+    from .packing import KEYFRAME_ENCODE_SEED, prepare_keyframe_image
+
+    cfg = video_vae.config
+    latents_mean = mx.array(np.array(cfg.latents_mean, np.float32)).reshape(1, -1, 1, 1, 1)
+    latents_std = mx.array(np.array(cfg.latents_std, np.float32)).reshape(1, -1, 1, 1, 1)
+    pixel_mean = np.array(PIXEL_MEAN, np.float32).reshape(1, 3, 1, 1, 1)
+    pixel_std = np.array(PIXEL_STD, np.float32).reshape(1, 3, 1, 1, 1)
+
+    mx.random.seed(KEYFRAME_ENCODE_SEED)
+    rows = []
+    for index, image in enumerate(images):
+        prepared = prepare_keyframe_image(image, height, width, stretch=index == 0)
+        pixels = np.asarray(prepared, dtype=np.float32).transpose(2, 0, 1)[None, :, None]
+        pixels = (pixels / 255.0 - pixel_mean) / pixel_std
+
+        # (1, 3, 1, H, W) -> channels-last for the spatial encoder.
+        moments = video_vae._encode_clip(mx.array(pixels).transpose(0, 2, 3, 4, 1))
+        channels = cfg.latent_channels
+        mean, logvar = moments[..., :channels], moments[..., channels:]
+        logvar = mx.clip(logvar, -30.0, 20.0)
+        std = mx.exp(0.5 * logvar)
+        latent = mean + std * mx.random.normal(mean.shape)
+        # -> (1, C, 1, H', W'), then the float16 round trip the reference relies on.
+        latent = latent.transpose(0, 4, 1, 2, 3).astype(mx.float16).astype(mx.float32)
+        normalized = (latent - latents_mean) / latents_std
+        rows.append(patchify_video_latents(normalized, patch_size))
+    return mx.concatenate(rows)
+
+
 @dataclass
 class GenerationResult:
     video: np.ndarray  # (frames, height, width, 3) uint8
@@ -163,48 +218,9 @@ class MiniMaxH3Pipeline:
     # -- keyframe conditioning ----------------------------------------------------------------
 
     def _encode_keyframes(self, images: list, height: int, width: int) -> mx.array:
-        """Encode ``fl2va`` keyframes into packed conditioning rows.
-
-        Keyframes are single frames, so they go through the video VAE's **spatial** encoder only —
-        none of its 17-frame temporal chunking applies. Two details of the reference are load-bearing
-        and easy to miss:
-
-        * the posterior is **sampled**, not taken at its mode, under a generator seeded with 42
-          independently of the request seed;
-        * the sampled latent is **rounded through float16** before normalization, which is about 11
-          bits of every conditioning latent — the released model's conditioning cannot be reproduced
-          without it.
-
-        MLX's RNG differs from torch's, so the seed-42 draw is not bit-identical to the reference's;
-        the distribution and every other step are.
-        """
-        from .packing import KEYFRAME_ENCODE_SEED, prepare_keyframe_image
-
-        cfg = self.video_vae.config
-        latents_mean = mx.array(np.array(cfg.latents_mean, np.float32)).reshape(1, -1, 1, 1, 1)
-        latents_std = mx.array(np.array(cfg.latents_std, np.float32)).reshape(1, -1, 1, 1, 1)
-        pixel_mean = np.array(PIXEL_MEAN, np.float32).reshape(1, 3, 1, 1, 1)
-        pixel_std = np.array(PIXEL_STD, np.float32).reshape(1, 3, 1, 1, 1)
-
-        mx.random.seed(KEYFRAME_ENCODE_SEED)
-        rows = []
-        for index, image in enumerate(images):
-            prepared = prepare_keyframe_image(image, height, width, stretch=index == 0)
-            pixels = np.asarray(prepared, dtype=np.float32).transpose(2, 0, 1)[None, :, None]
-            pixels = (pixels / 255.0 - pixel_mean) / pixel_std
-
-            # (1, 3, 1, H, W) -> channels-last for the spatial encoder.
-            moments = self.video_vae._encode_clip(mx.array(pixels).transpose(0, 2, 3, 4, 1))
-            channels = cfg.latent_channels
-            mean, logvar = moments[..., :channels], moments[..., channels:]
-            logvar = mx.clip(logvar, -30.0, 20.0)
-            std = mx.exp(0.5 * logvar)
-            latent = mean + std * mx.random.normal(mean.shape)
-            # -> (1, C, 1, H', W'), then the float16 round trip the reference relies on.
-            latent = latent.transpose(0, 4, 1, 2, 3).astype(mx.float16).astype(mx.float32)
-            normalized = (latent - latents_mean) / latents_std
-            rows.append(patchify_video_latents(normalized, self.dit.config.patch_size))
-        return mx.concatenate(rows)
+        return encode_keyframe_rows(
+            self.video_vae, images, height, width, self.dit.config.patch_size
+        )
 
     # -- generation ---------------------------------------------------------------------------
 

@@ -347,6 +347,69 @@ class MiniMaxH3DiT(nn.Module):
         fraction = (position - lower.astype(mx.float32))[:, None]
         return self.adaln_t_table[lower] * (1.0 - fraction) + self.adaln_t_table[lower + 1] * fraction
 
+    def pack_inputs(
+        self,
+        video_latents: mx.array,
+        audio_latents: mx.array,
+        text_embeds: mx.array,
+        timestep: mx.array,
+        timestep_indices: mx.array,
+        token_tags: mx.array,
+        position_ids: mx.array,
+        video_indices: mx.array,
+        audio_indices: mx.array,
+        text_indices: mx.array,
+    ) -> tuple[mx.array, mx.array, mx.array, tuple[mx.array, mx.array]]:
+        """Everything the block stack needs before its first block: ``(x, temb, adaln_rows, rope)``.
+
+        Split out of :meth:`__call__` so a step-skipping sampler can evaluate the block-0 modulated
+        input — its skip indicator — without running the 50-block stack. The projections here are
+        ~0.03% of a forward, so recomputing them on a probe is free relative to what a skip saves.
+        """
+        seq_len = position_ids.shape[0]
+        if position_ids.ndim != 2 or position_ids.shape[-1] != 3:
+            raise ValueError(f"`position_ids` must be (seq_len, 3), got {position_ids.shape}.")
+        if token_tags.shape != (seq_len,) or timestep_indices.shape != (seq_len,):
+            raise ValueError(
+                "`token_tags` and `timestep_indices` must be (seq_len,) matching `position_ids`, got "
+                f"{token_tags.shape} and {timestep_indices.shape} for seq_len={seq_len}."
+            )
+
+        rotary = self.rope(position_ids)
+
+        # 1. Project each modality and scatter the rows into the packed buffer. The text stream
+        #    sets the dtype of the packed sequence.
+        video_embeds = self.video_patch_proj(video_latents.astype(param_dtype(self.video_patch_proj)))
+        audio_embeds = self.audio_patch_proj(audio_latents.astype(param_dtype(self.audio_patch_proj)))
+        text = self.condition_proj(text_embeds.astype(param_dtype(self.condition_proj)))
+        text = self.token_refiner(text)
+
+        B = text.shape[0]
+        x = mx.zeros((B, seq_len, text.shape[-1]), dtype=text.dtype)
+        x[:, text_indices] = text
+        x[:, video_indices] = video_embeds.astype(text.dtype)
+        x[:, audio_indices] = audio_embeds.astype(text.dtype)
+
+        # 2. One timestep embedding per distinct noise level, shared by all AdaLN projections.
+        temb = self.embed_timesteps(timestep)
+
+        # 3. Row -> AdaLN table row. `maximum(tags, 0)` mirrors the reference clamp: padding rows
+        #    carry tag -1 and must not index backwards. They never reach the outputs.
+        adaln_indices = timestep_indices * MODALITY_NUM + mx.maximum(token_tags, 0)
+        return x, temb, adaln_indices, rotary
+
+    def skip_indicator(self, x: mx.array, adaln_indices: mx.array, modulation) -> mx.array:
+        """The block-0 AdaLN-modulated input — the quantity a TeaCache-style skip test watches.
+
+        The modulation carries the timestep, so this tensor moves both with the trajectory and with
+        the schedule; its step-to-step relative L1 is the standard proxy for how much the stack's
+        output would have moved.
+        """
+        block = self.blocks[0]
+        shift_msa, scale_msa = modulation[0], modulation[1]
+        h = block.norm1(x)
+        return h * (1.0 + scale_msa[adaln_indices]) + shift_msa[adaln_indices]
+
     def __call__(
         self,
         video_latents: mx.array,
@@ -380,36 +443,18 @@ class MiniMaxH3DiT(nn.Module):
             ``(video_velocity, audio_velocity)`` in the row order of ``video_indices`` /
             ``audio_indices``.
         """
-        seq_len = position_ids.shape[0]
-        if position_ids.ndim != 2 or position_ids.shape[-1] != 3:
-            raise ValueError(f"`position_ids` must be (seq_len, 3), got {position_ids.shape}.")
-        if token_tags.shape != (seq_len,) or timestep_indices.shape != (seq_len,):
-            raise ValueError(
-                "`token_tags` and `timestep_indices` must be (seq_len,) matching `position_ids`, got "
-                f"{token_tags.shape} and {timestep_indices.shape} for seq_len={seq_len}."
-            )
-
-        rotary = self.rope(position_ids)
-
-        # 1. Project each modality and scatter the rows into the packed buffer. The text stream
-        #    sets the dtype of the packed sequence.
-        video_embeds = self.video_patch_proj(video_latents.astype(param_dtype(self.video_patch_proj)))
-        audio_embeds = self.audio_patch_proj(audio_latents.astype(param_dtype(self.audio_patch_proj)))
-        text = self.condition_proj(text_embeds.astype(param_dtype(self.condition_proj)))
-        text = self.token_refiner(text)
-
-        B = text.shape[0]
-        x = mx.zeros((B, seq_len, text.shape[-1]), dtype=text.dtype)
-        x[:, text_indices] = text
-        x[:, video_indices] = video_embeds.astype(text.dtype)
-        x[:, audio_indices] = audio_embeds.astype(text.dtype)
-
-        # 2. One timestep embedding per distinct noise level, shared by all AdaLN projections.
-        temb = self.embed_timesteps(timestep)
-
-        # 3. Row -> AdaLN table row. `maximum(tags, 0)` mirrors the reference clamp: padding rows
-        #    carry tag -1 and must not index backwards. They never reach the outputs.
-        adaln_indices = timestep_indices * MODALITY_NUM + mx.maximum(token_tags, 0)
+        x, temb, adaln_indices, rotary = self.pack_inputs(
+            video_latents,
+            audio_latents,
+            text_embeds,
+            timestep,
+            timestep_indices,
+            token_tags,
+            position_ids,
+            video_indices,
+            audio_indices,
+            text_indices,
+        )
 
         for i, block in enumerate(self.blocks):
             modulation = (

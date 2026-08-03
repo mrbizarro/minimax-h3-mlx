@@ -28,6 +28,7 @@ from minimax_h3_mlx.media import save_mp4
 from minimax_h3_mlx.packing import (
     AUDIO_CHANNELS,
     FPS,
+    KEYFRAME_NOISE_AUG,
     PIXEL_MEAN,
     PIXEL_STD,
     align_num_frames,
@@ -39,7 +40,9 @@ from minimax_h3_mlx.packing import (
     unpatchify_video_tokens,
     video_latent_num_frames,
 )
+from minimax_h3_mlx.pipeline import encode_keyframe_rows
 from minimax_h3_mlx.scheduler import MiniMaxH3Scheduler
+from minimax_h3_mlx.stepcache import StepResidualCache
 from minimax_h3_mlx.text_encoder import MiniMaxH3TextEncoder
 
 
@@ -98,7 +101,12 @@ def build_schedules(points: int, config: PipelineConfig):
 def row_timestep_plan(layout, video_timesteps, audio_timesteps):
     per_step = []
     for t, at in zip(video_timesteps.tolist(), audio_timesteps.tolist()):
-        distinct, inverse = build_row_timesteps(layout, float(t), float(at), float(t), 1.0)
+        # Keyframe rows are pinned at their noise-augmentation level for the whole run. With no
+        # keyframe the layout has no conditioning rows, so the extra level never appears in the
+        # table and the schedule is unchanged.
+        distinct, inverse = build_row_timesteps(
+            layout, float(t), float(at), max(float(t), KEYFRAME_NOISE_AUG), 1.0
+        )
         per_step.append((np.array(distinct), np.array(inverse)))
     table = sorted({float(value) for distinct, _ in per_step for value in distinct})
     lookup = {value: index for index, value in enumerate(table)}
@@ -141,6 +149,13 @@ def main() -> int:
     parser.add_argument("--compact-root", type=Path, required=True)
     parser.add_argument("--text-config", type=Path, required=True)
     parser.add_argument("--prompt-cache", type=Path, default=None)
+    parser.add_argument(
+        "--first-frame",
+        type=Path,
+        default=None,
+        help="FL2VA first-frame conditioning: the still is fed to the vision tower as part of the "
+        "request and video-VAE encoded into the packed keyframe slot.",
+    )
     parser.add_argument("-o", "--output", type=Path, required=True)
     parser.add_argument("--metrics", type=Path, required=True)
     parser.add_argument("--frames", type=int, default=22, help="snapped up to the 17n+5 grid")
@@ -150,6 +165,33 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--wired-gb", type=float, default=50.0)
     parser.add_argument("--memory-gb", type=float, default=58.0)
+    parser.add_argument(
+        "--step-cache",
+        type=float,
+        default=0.0,
+        metavar="THRESHOLD",
+        help="TeaCache-class residual reuse: skip a forward while the accumulated relative L1 of "
+        "the block-0 modulated input stays below THRESHOLD. 0 disables it.",
+    )
+    parser.add_argument(
+        "--step-cache-max-skip",
+        type=int,
+        default=2,
+        help="Longest run of consecutive skipped forwards allowed inside the error budget.",
+    )
+    parser.add_argument(
+        "--step-cache-probe",
+        action="store_true",
+        help="Record the per-step relative L1 without ever skipping. Lets one reference render "
+        "supply the curve every threshold would be chosen from, instead of guessing.",
+    )
+    parser.add_argument(
+        "--playback-fps",
+        type=float,
+        default=None,
+        help="Write the mp4 at this frame rate instead of 24. Use with a reduced --frames to trade "
+        "temporal density for packed rows; audio is stretched to match.",
+    )
     args = parser.parse_args()
 
     if args.height % 32 or args.width % 32:
@@ -172,6 +214,9 @@ def main() -> int:
         "sigma_points": args.steps,
         "forwards": args.steps - 1,
         "seed": args.seed,
+        "step_cache_threshold": args.step_cache,
+        "step_cache_max_skip": args.step_cache_max_skip,
+        "playback_fps": args.playback_fps or FPS,
         "wired_gb": round(gb(wired_bytes), 3),
         "memory_limit_gb": round(gb(memory_bytes), 3),
         "device": device,
@@ -182,25 +227,36 @@ def main() -> int:
     mx.set_memory_limit(memory_bytes)
 
     try:
+        keyframes = None
+        if args.first_frame is not None:
+            from PIL import Image
+
+            keyframes = [Image.open(args.first_frame).convert("RGB")]
+
         if args.prompt_cache is not None and args.prompt_cache.exists():
             with record.phase("text_cache_load"):
                 cached = np.load(args.prompt_cache, allow_pickle=False)
                 cached_prompt = str(cached["prompt"].item())
                 if cached_prompt != args.prompt:
                     raise ValueError("The prompt cache belongs to a different prompt.")
+                cached_frame = str(cached["first_frame"].item()) if "first_frame" in cached else ""
+                if cached_frame != (str(args.first_frame) if args.first_frame else ""):
+                    raise ValueError("The prompt cache was built for a different first frame.")
                 embeds = mx.array(cached["embeds"]).astype(mx.bfloat16)
                 text_tags = cached["text_tags"].astype(np.int64)
                 mx.eval(embeds)
         else:
             with record.phase("text_encode_q8"):
+                # A keyframe request runs through the vision tower: H3 conditions on the still
+                # twice, once as VL tokens in the text stream and once as VAE conditioning rows.
                 encoder = MiniMaxH3TextEncoder(
                     args.compact_root,
                     dtype=mx.bfloat16,
-                    load_vision=False,
+                    load_vision=keyframes is not None,
                     verbose=True,
                     config_path=args.text_config,
                 )
-                embeds, text_tags = encoder.encode(args.prompt)
+                embeds, text_tags = encoder.encode(args.prompt, keyframes)
                 embeds = mx.array(embeds)
                 mx.eval(embeds)
                 if args.prompt_cache is not None:
@@ -208,6 +264,7 @@ def main() -> int:
                     np.savez_compressed(
                         args.prompt_cache,
                         prompt=np.array(args.prompt),
+                        first_frame=np.array(str(args.first_frame) if args.first_frame else ""),
                         embeds=np.array(embeds.astype(mx.float32)),
                         text_tags=text_tags,
                     )
@@ -220,13 +277,29 @@ def main() -> int:
         latent_frames = video_latent_num_frames(frames)
         latent_h, latent_w = args.height // 16, args.width // 16
         audio_latents = audio_latent_num_frames(frames)
+        patch = (1, 2, 2)
+
+        # The keyframe is encoded while only the 5 GB video VAE is resident, before the DiT lands.
+        condition_rows = None
+        anchors: tuple[str, ...] = ()
+        if keyframes is not None:
+            anchors = ("first",)
+            with record.phase("keyframe_encode"):
+                keyframe_vae = load_compact_video_vae(args.compact_root / "video_vae.safetensors")
+                condition_rows = encode_keyframe_rows(
+                    keyframe_vae, keyframes, args.height, args.width, patch
+                )
+                mx.eval(condition_rows)
+                print(f"keyframe conditioning rows: {condition_rows.shape}")
+            del keyframe_vae
+            release()
 
         with record.phase("dit_load_bf16"):
             dit = load_dit(args.dit, verbose=True)
             patch = dit.config.patch_size
 
         layout = build_packed_sequence(
-            text_tags, latent_frames, latent_h, latent_w, audio_latents, patch
+            text_tags, latent_frames, latent_h, latent_w, audio_latents, patch, anchors
         )
         print(
             f"geometry: {args.width}x{args.height}, {frames} frames, "
@@ -248,7 +321,14 @@ def main() -> int:
             freed = drop_adaln_weights(dit)
             mx.clear_cache()
             print(f"AdaLN cache {cache.nbytes()/1024**2:.1f} MiB; dropped {gb(freed):.2f} GiB")
+            # Draw order matches the reference pipeline: conditioning noise first, then video,
+            # then audio, so a seed reproduces the same run with and without the staged loader.
             mx.random.seed(args.seed)
+            if condition_rows is not None:
+                condition_noise = mx.random.normal(condition_rows.shape).astype(mx.float32)
+                condition_rows = MiniMaxH3Scheduler(
+                    shift=config.sigma_shift_video
+                ).scale_noise(condition_rows, KEYFRAME_NOISE_AUG, condition_noise)
             latents = mx.random.normal(
                 (1, dit.config.latents_dim, latent_frames, latent_h, latent_w)
             ).astype(mx.float32)
@@ -256,13 +336,26 @@ def main() -> int:
             audio_rows = mx.random.normal(
                 (audio_latents * AUDIO_CHANNELS, dit.config.audio_latents_dim)
             ).astype(mx.float32)
+            if condition_rows is not None:
+                video_rows = mx.concatenate([condition_rows, video_rows])
             mx.eval(video_rows, audio_rows)
+
+        n_cond_v = layout.num_condition_video_rows
+
+        num_forwards = len(video_sched.timesteps)
+        step_cache = (
+            StepResidualCache(
+                args.step_cache, num_forwards, max_skip=args.step_cache_max_skip
+            )
+            if args.step_cache > 0 or args.step_cache_probe
+            else None
+        )
 
         step_times = []
         with record.phase("joint_denoise"):
             for index, timestep in enumerate(video_sched.timesteps.tolist()):
                 started = time.perf_counter()
-                video_pred, audio_pred = dit(
+                forward_args = (
                     video_rows[None].astype(mx.bfloat16),
                     audio_rows[None].astype(mx.bfloat16),
                     embeds.astype(mx.bfloat16),
@@ -273,24 +366,53 @@ def main() -> int:
                     layout.video_indices,
                     layout.audio_indices,
                     layout.text_indices,
-                    modulation_cache=cache,
                 )
-                video_rows = video_sched.step(
-                    video_pred[0].astype(mx.float32), float(timestep), video_rows
+
+                skip = False
+                if step_cache is not None:
+                    x, _, adaln_indices, _ = dit.pack_inputs(*forward_args)
+                    indicator = dit.skip_indicator(x, adaln_indices, cache.get(0))
+                    mx.eval(indicator)
+                    del x
+                    skip = step_cache.decide(index, indicator)
+
+                if skip:
+                    video_pred, audio_pred = step_cache.reuse(video_rows, audio_rows)
+                else:
+                    video_out, audio_out = dit(*forward_args, modulation_cache=cache)
+                    video_pred = video_out[0].astype(mx.float32)
+                    audio_pred = audio_out[0].astype(mx.float32)
+                    if step_cache is not None:
+                        step_cache.store(video_rows, audio_rows, video_pred, audio_pred)
+
+                # Only generated rows are written back; keyframe anchors survive untouched, so no
+                # masking is needed. Rebind rather than assign into a slice — the stepped result is
+                # a lazy graph over the very rows it would overwrite.
+                stepped_video = video_sched.step(
+                    video_pred[n_cond_v:], float(timestep), video_rows[n_cond_v:]
                 )
                 audio_rows = audio_sched.step(
-                    audio_pred[0].astype(mx.float32),
+                    audio_pred,
                     float(audio_sched.timesteps[index].item()),
                     audio_rows,
+                )
+                video_rows = (
+                    mx.concatenate([video_rows[:n_cond_v], stepped_video])
+                    if n_cond_v
+                    else stepped_video
                 )
                 mx.eval(video_rows, audio_rows)
                 elapsed = time.perf_counter() - started
                 step_times.append(elapsed)
                 print(
-                    f"step {index+1}/{len(video_sched.timesteps)}: {elapsed:.1f}s "
+                    f"step {index+1}/{num_forwards}: {elapsed:.1f}s"
+                    f"{' [reused]' if skip else ''} "
                     f"(active {gb(mx.get_active_memory()):.1f} GiB)",
                     flush=True,
                 )
+        if step_cache is not None:
+            record.data["step_cache"] = step_cache.summary()
+            print(f"step cache: reused {step_cache.skipped}/{num_forwards} forwards")
 
         mx.eval(video_rows, audio_rows)
         del dit, cache, plan, timestep_table, video_sched, audio_sched
@@ -299,7 +421,7 @@ def main() -> int:
         with record.phase("video_vae_decode"):
             video_vae = load_compact_video_vae(args.compact_root / "video_vae.safetensors")
             video = decode_video(
-                video_vae, video_rows, frames, latent_frames, latent_h, latent_w, patch
+                video_vae, video_rows[n_cond_v:], frames, latent_frames, latent_h, latent_w, patch
             )
         del video_vae, video_rows
         release()
@@ -313,7 +435,15 @@ def main() -> int:
 
         with record.phase("encode_mux"):
             args.output.parent.mkdir(parents=True, exist_ok=True)
-            save_mp4(args.output, video, FPS, audio, sample_rate)
+            playback = float(args.playback_fps or FPS)
+            save_mp4(
+                args.output,
+                video,
+                playback,
+                audio,
+                sample_rate,
+                audio_tempo=playback / FPS,
+            )
 
         record.data.update(
             {

@@ -36,12 +36,18 @@ def save_wav(path: str | Path, audio: np.ndarray, sample_rate: int) -> Path:
 def save_mp4(
     path: str | Path,
     video: np.ndarray,
-    fps: int,
+    fps: float,
     audio: np.ndarray | None = None,
     sample_rate: int = 32000,
     crf: int = 18,
+    audio_tempo: float = 1.0,
 ) -> Path:
     """Encode ``(frames, height, width, 3)`` uint8 video, muxing audio when given.
+
+    ``audio_tempo`` below 1.0 stretches the generated audio to cover a clip written at a reduced
+    frame rate. ``atempo`` preserves pitch, so speech stays intelligible where a plain resample
+    would drop it an octave — but it is a time-stretch artefact, not a model output, and long
+    stretches audibly smear transients.
 
     Raises if ``ffmpeg`` is not on PATH; use :func:`save_frames` in that case.
     """
@@ -64,7 +70,16 @@ def save_mp4(
         "-s", f"{width}x{height}", "-r", str(fps), "-i", "pipe:0",
     ]
     if audio_path is not None:
-        cmd += ["-i", str(audio_path), "-c:a", "aac", "-b:a", "192k", "-shortest"]
+        cmd += ["-i", str(audio_path)]
+        if abs(audio_tempo - 1.0) > 1e-6:
+            # atempo is only defined on [0.5, 100]; chain factors for anything slower.
+            factors, remaining = [], float(audio_tempo)
+            while remaining < 0.5:
+                factors.append(0.5)
+                remaining /= 0.5
+            factors.append(remaining)
+            cmd += ["-filter:a", ",".join(f"atempo={f:.6f}" for f in factors)]
+        cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
     cmd += ["-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p", str(path)]
 
     process = subprocess.run(cmd, input=video.tobytes(), capture_output=True)
