@@ -141,8 +141,15 @@ def load_dit(
                 unexpected.append(key)
                 continue
             if dtype is not None:
-                tensor = tensor.astype(dtype)
+                # Bulk conversion of the whole 33B stack. Done on the CPU stream and materialized
+                # per tensor: casting ~130 GB through Metal is enough submissions to trip the
+                # command-buffer limits when anything else is using the device, and this path is
+                # I/O-dominated anyway.
+                with mx.stream(mx.cpu):
+                    tensor = tensor.astype(dtype)
+                    mx.eval(tensor)
             elif is_fp32_key(key) and tensor.dtype != mx.float32:
+                # Only twelve small tensors; not worth a stream switch.
                 tensor = tensor.astype(mx.float32)
             weights[key] = tensor
         if verbose:
