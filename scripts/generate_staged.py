@@ -143,6 +143,273 @@ def decode_audio(model, rows, audio_latents: int, frames: int):
     return waveform[:, :samples].astype(np.float32)
 
 
+def stitch_windows(segments, sample_rate: int, crossfade_seconds: float):
+    """Butt-join chained windows in pixel space and cross-fade their audio at every seam.
+
+    Each window after the first opens on a re-render of its predecessor's last frame, so that
+    duplicate frame is dropped from the head — the reference behaviour. The audio of the dropped
+    frame is *not* thrown away: it is the only material the chain owns that covers the same instant
+    of scene time as the outgoing window's tail, which makes a true overlap cross-fade possible
+    while keeping every later sample exactly where the video puts it.
+
+    That bounds the fade at one frame (41.7 ms at 24 fps). Asking for more would mean either
+    consuming audio the video still needs — WanGP's blind ``np.concatenate`` has the opposite
+    failure, an untreated step discontinuity at every seam — or letting the whole tail of the clip
+    drift ahead of the picture by the fade length per seam, which is worse than the click it fixes.
+    """
+    frame_samples = int(round(sample_rate / FPS))
+    fade = min(int(round(crossfade_seconds * sample_rate)), frame_samples)
+
+    video_parts = [segments[0][0]]
+    audio_parts = [segments[0][1]]
+    seams = []
+    for video, audio in segments[1:]:
+        video_parts.append(video[1:])
+        tail = audio_parts[-1]
+        span = min(fade, tail.shape[1], frame_samples, audio.shape[1])
+        joined_at = int(sum(part.shape[1] for part in audio_parts))
+        seam = {"sample": joined_at, "fade_samples": int(span)}
+        if span > 0:
+            # Equal power: two independently generated windows are uncorrelated across the seam, so
+            # a linear pair would dip ~3 dB in the middle of the fade.
+            ramp = (np.arange(span, dtype=np.float32) + 0.5) / span
+            blended = tail[:, -span:] * np.cos(ramp * np.pi / 2) + (
+                audio[:, frame_samples - span : frame_samples] * np.sin(ramp * np.pi / 2)
+            )
+            audio_parts[-1] = np.concatenate([tail[:, :-span], blended], axis=1)
+        audio_parts.append(audio[:, frame_samples:])
+        seams.append(seam)
+
+    return (
+        np.concatenate(video_parts, axis=0),
+        np.concatenate(audio_parts, axis=1).astype(np.float32),
+        seams,
+    )
+
+
+def render_window(
+    args,
+    record,
+    *,
+    label: str,
+    frames: int,
+    seed: int,
+    keyframe,
+    first_frame_key: str,
+    prompt_cache: Path | None,
+):
+    """Render one window end to end and hand back decoded pixels, audio and the sample rate.
+
+    Every large model is loaded, used and released inside this call, so a chain of windows runs in
+    one process without the previous window's DiT still being resident. ``label`` prefixes the
+    phase names so a chained metrics file stays readable.
+    """
+    keyframes = [keyframe] if keyframe is not None else None
+
+    if prompt_cache is not None and prompt_cache.exists():
+        with record.phase(f"{label}text_cache_load"):
+            cached = np.load(prompt_cache, allow_pickle=False)
+            cached_prompt = str(cached["prompt"].item())
+            if cached_prompt != args.prompt:
+                raise ValueError("The prompt cache belongs to a different prompt.")
+            cached_frame = str(cached["first_frame"].item()) if "first_frame" in cached else ""
+            if cached_frame != first_frame_key:
+                raise ValueError("The prompt cache was built for a different first frame.")
+            embeds = mx.array(cached["embeds"]).astype(mx.bfloat16)
+            text_tags = cached["text_tags"].astype(np.int64)
+            mx.eval(embeds)
+    else:
+        with record.phase(f"{label}text_encode_q8"):
+            # A keyframe request runs through the vision tower: H3 conditions on the still
+            # twice, once as VL tokens in the text stream and once as VAE conditioning rows.
+            encoder = MiniMaxH3TextEncoder(
+                args.compact_root,
+                dtype=mx.bfloat16,
+                load_vision=keyframes is not None,
+                verbose=True,
+                config_path=args.text_config,
+            )
+            embeds, text_tags = encoder.encode(args.prompt, keyframes)
+            embeds = mx.array(embeds)
+            mx.eval(embeds)
+            if prompt_cache is not None:
+                prompt_cache.parent.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(
+                    prompt_cache,
+                    prompt=np.array(args.prompt),
+                    first_frame=np.array(first_frame_key),
+                    embeds=np.array(embeds.astype(mx.float32)),
+                    text_tags=text_tags,
+                )
+        del encoder
+    record.data[f"{label}prompt_tokens"] = int(len(text_tags))
+    record.flush()
+    release()
+
+    config = PipelineConfig()
+    latent_frames = video_latent_num_frames(frames)
+    latent_h, latent_w = args.height // 16, args.width // 16
+    audio_latents = audio_latent_num_frames(frames)
+    patch = (1, 2, 2)
+
+    # The keyframe is encoded while only the 5 GB video VAE is resident, before the DiT lands.
+    condition_rows = None
+    anchors: tuple[str, ...] = ()
+    if keyframes is not None:
+        anchors = ("first",)
+        with record.phase(f"{label}keyframe_encode"):
+            keyframe_vae = load_compact_video_vae(args.compact_root / "video_vae.safetensors")
+            condition_rows = encode_keyframe_rows(
+                keyframe_vae, keyframes, args.height, args.width, patch
+            )
+            mx.eval(condition_rows)
+            print(f"keyframe conditioning rows: {condition_rows.shape}")
+        del keyframe_vae
+        release()
+
+    with record.phase(f"{label}dit_load_bf16"):
+        dit = load_dit(args.dit, verbose=True)
+        patch = dit.config.patch_size
+
+    layout = build_packed_sequence(
+        text_tags, latent_frames, latent_h, latent_w, audio_latents, patch, anchors
+    )
+    print(
+        f"geometry: {args.width}x{args.height}, {frames} frames, "
+        f"{layout.sequence_length:,} packed rows",
+        flush=True,
+    )
+    record.data[f"{label}packed_rows"] = int(layout.sequence_length)
+    record.data[f"{label}video_rows"] = int(layout.video_indices.shape[0])
+    record.data[f"{label}audio_rows"] = int(layout.audio_indices.shape[0])
+    record.flush()
+
+    with record.phase(f"{label}adaln_cache_and_noise"):
+        video_sched, audio_sched = build_schedules(args.steps, config)
+        timestep_table, plan = row_timestep_plan(
+            layout, video_sched.timesteps, audio_sched.timesteps
+        )
+        cache = ModulationCache.build(dit, timestep_table, dtype=mx.bfloat16)
+        mx.eval(cache.tables)
+        freed = drop_adaln_weights(dit)
+        mx.clear_cache()
+        print(f"AdaLN cache {cache.nbytes()/1024**2:.1f} MiB; dropped {gb(freed):.2f} GiB")
+        # Draw order matches the reference pipeline: conditioning noise first, then video,
+        # then audio, so a seed reproduces the same run with and without the staged loader.
+        mx.random.seed(seed)
+        if condition_rows is not None:
+            condition_noise = mx.random.normal(condition_rows.shape).astype(mx.float32)
+            condition_rows = MiniMaxH3Scheduler(
+                shift=config.sigma_shift_video
+            ).scale_noise(condition_rows, KEYFRAME_NOISE_AUG, condition_noise)
+        latents = mx.random.normal(
+            (1, dit.config.latents_dim, latent_frames, latent_h, latent_w)
+        ).astype(mx.float32)
+        video_rows = patchify_video_latents(latents, patch)
+        audio_rows = mx.random.normal(
+            (audio_latents * AUDIO_CHANNELS, dit.config.audio_latents_dim)
+        ).astype(mx.float32)
+        if condition_rows is not None:
+            video_rows = mx.concatenate([condition_rows, video_rows])
+        mx.eval(video_rows, audio_rows)
+
+    n_cond_v = layout.num_condition_video_rows
+
+    num_forwards = len(video_sched.timesteps)
+    step_cache = (
+        StepResidualCache(args.step_cache, num_forwards, max_skip=args.step_cache_max_skip)
+        if args.step_cache > 0 or args.step_cache_probe
+        else None
+    )
+
+    step_times = []
+    with record.phase(f"{label}joint_denoise"):
+        for index, timestep in enumerate(video_sched.timesteps.tolist()):
+            started = time.perf_counter()
+            forward_args = (
+                video_rows[None].astype(mx.bfloat16),
+                audio_rows[None].astype(mx.bfloat16),
+                embeds.astype(mx.bfloat16),
+                timestep_table,
+                plan[index],
+                layout.token_tags,
+                layout.position_ids,
+                layout.video_indices,
+                layout.audio_indices,
+                layout.text_indices,
+            )
+
+            skip = False
+            if step_cache is not None:
+                x, _, adaln_indices, _ = dit.pack_inputs(*forward_args)
+                indicator = dit.skip_indicator(x, adaln_indices, cache.get(0))
+                mx.eval(indicator)
+                del x
+                skip = step_cache.decide(index, indicator)
+
+            if skip:
+                video_pred, audio_pred = step_cache.reuse(video_rows, audio_rows)
+            else:
+                video_out, audio_out = dit(*forward_args, modulation_cache=cache)
+                video_pred = video_out[0].astype(mx.float32)
+                audio_pred = audio_out[0].astype(mx.float32)
+                if step_cache is not None:
+                    step_cache.store(video_rows, audio_rows, video_pred, audio_pred)
+
+            # Only generated rows are written back; keyframe anchors survive untouched, so no
+            # masking is needed. Rebind rather than assign into a slice — the stepped result is
+            # a lazy graph over the very rows it would overwrite.
+            stepped_video = video_sched.step(
+                video_pred[n_cond_v:], float(timestep), video_rows[n_cond_v:]
+            )
+            audio_rows = audio_sched.step(
+                audio_pred,
+                float(audio_sched.timesteps[index].item()),
+                audio_rows,
+            )
+            video_rows = (
+                mx.concatenate([video_rows[:n_cond_v], stepped_video])
+                if n_cond_v
+                else stepped_video
+            )
+            mx.eval(video_rows, audio_rows)
+            elapsed = time.perf_counter() - started
+            step_times.append(elapsed)
+            print(
+                f"step {index+1}/{num_forwards}: {elapsed:.1f}s"
+                f"{' [reused]' if skip else ''} "
+                f"(active {gb(mx.get_active_memory()):.1f} GiB)",
+                flush=True,
+            )
+    if step_cache is not None:
+        record.data[f"{label}step_cache"] = step_cache.summary()
+        print(f"step cache: reused {step_cache.skipped}/{num_forwards} forwards")
+
+    mx.eval(video_rows, audio_rows)
+    del dit, cache, plan, timestep_table, video_sched, audio_sched
+    release()
+
+    with record.phase(f"{label}video_vae_decode"):
+        video_vae = load_compact_video_vae(args.compact_root / "video_vae.safetensors")
+        video = decode_video(
+            video_vae, video_rows[n_cond_v:], frames, latent_frames, latent_h, latent_w, patch
+        )
+    del video_vae, video_rows
+    release()
+
+    with record.phase(f"{label}audio_vae_decode"):
+        audio_vae = load_compact_audio_vae(args.compact_root / "audio_vae.safetensors")
+        audio = decode_audio(audio_vae, audio_rows, audio_latents, frames)
+        sample_rate = audio_vae.config.sampling_rate
+    del audio_vae, audio_rows, embeds, layout
+    release()
+
+    record.data[f"{label}mean_denoise_step_seconds"] = round(float(np.mean(step_times)), 3)
+    record.data[f"{label}denoise_step_seconds"] = [round(value, 3) for value in step_times]
+    record.flush()
+    return video, audio, int(sample_rate), step_times
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("prompt")
@@ -193,13 +460,53 @@ def main() -> int:
         help="Write the mp4 at this frame rate instead of 24. Use with a reduced --frames to trade "
         "temporal density for packed rows; audio is stretched to match.",
     )
+    parser.add_argument(
+        "--chain-windows",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Generate the clip as N chained --frames windows instead of one dense pass. Each "
+        "window after the first is conditioned on its predecessor's last decoded frame through "
+        "the ordinary first-frame keyframe path; the duplicate frame is dropped at the join. "
+        "1 (the default) is the untouched dense path.",
+    )
+    parser.add_argument(
+        "--chain-total-frames",
+        type=int,
+        default=None,
+        metavar="F",
+        help="Trim the stitched clip to F frames. A chain delivers frames + (N-1)*(frames-1), so "
+        "this is how a chain lands on an exact duration rather than a window multiple.",
+    )
+    parser.add_argument(
+        "--chain-audio-crossfade",
+        type=float,
+        default=1.0 / FPS,
+        metavar="SECONDS",
+        help="Equal-power audio cross-fade at every seam, capped at one frame — the chain's real "
+        "overlap. 0 reproduces WanGP's blind concatenation, seam pops included.",
+    )
+    parser.add_argument(
+        "--chain-keep-windows",
+        action="store_true",
+        help="Also write each window's own mp4 (and its wav sidecar) beside the stitched output.",
+    )
     args = parser.parse_args()
 
     if args.height % 32 or args.width % 32:
         parser.error("--height and --width must be multiples of 32")
     if args.steps < 2:
         parser.error("--steps must be at least 2")
+    if args.chain_windows < 1:
+        parser.error("--chain-windows must be at least 1")
+    if args.chain_windows > 1 and args.playback_fps is not None:
+        parser.error("--chain-windows and --playback-fps do not compose; the seam maths is 24 fps")
     frames = align_num_frames(args.frames)
+    chain = args.chain_windows
+    chain_frames = frames + (chain - 1) * (frames - 1)
+    if args.chain_total_frames is not None and not 1 <= args.chain_total_frames <= chain_frames:
+        parser.error(f"--chain-total-frames must be in 1..{chain_frames} for this chain")
+    delivered_frames = args.chain_total_frames or chain_frames
     device = mx.device_info()
     max_wired = int(device["max_recommended_working_set_size"])
     wired_bytes = min(int(args.wired_gb * 1024**3), max_wired - 1024**2)
@@ -218,6 +525,10 @@ def main() -> int:
         "step_cache_threshold": args.step_cache,
         "step_cache_max_skip": args.step_cache_max_skip,
         "playback_fps": args.playback_fps or FPS,
+        "chain_windows": chain,
+        "chain_frames": chain_frames,
+        "chain_delivered_frames": delivered_frames,
+        "chain_audio_crossfade": args.chain_audio_crossfade if chain > 1 else None,
         # Which video-VAE decode mode produced this run, so a metrics file is self-describing
         # when someone compares decode phases across the campaign. 0/1 is the per-tile loop.
         "vae_decode_batch": resolved_decode_batch(),
@@ -231,7 +542,7 @@ def main() -> int:
     mx.set_memory_limit(memory_bytes)
 
     try:
-        keyframes = None
+        base_keyframe = None
         if args.first_frame is not None:
             from PIL import Image
 
@@ -240,231 +551,94 @@ def main() -> int:
             # Put the still on the render canvas once, before either encoder sees it. The VAE would
             # do this anyway; doing it up front also means the vision tower's `smart_resize` is a
             # no-op on axes that are already multiples of 32, so both encoders read the same pixels.
-            keyframes = [
-                prepare_keyframe_image(
-                    Image.open(args.first_frame).convert("RGB"),
-                    args.height,
-                    args.width,
-                    stretch=True,
-                )
-            ]
+            base_keyframe = prepare_keyframe_image(
+                Image.open(args.first_frame).convert("RGB"),
+                args.height,
+                args.width,
+                stretch=True,
+            )
 
-        if args.prompt_cache is not None and args.prompt_cache.exists():
-            with record.phase("text_cache_load"):
-                cached = np.load(args.prompt_cache, allow_pickle=False)
-                cached_prompt = str(cached["prompt"].item())
-                if cached_prompt != args.prompt:
-                    raise ValueError("The prompt cache belongs to a different prompt.")
-                cached_frame = str(cached["first_frame"].item()) if "first_frame" in cached else ""
-                if cached_frame != (str(args.first_frame) if args.first_frame else ""):
-                    raise ValueError("The prompt cache was built for a different first frame.")
-                embeds = mx.array(cached["embeds"]).astype(mx.bfloat16)
-                text_tags = cached["text_tags"].astype(np.int64)
-                mx.eval(embeds)
-        else:
-            with record.phase("text_encode_q8"):
-                # A keyframe request runs through the vision tower: H3 conditions on the still
-                # twice, once as VL tokens in the text stream and once as VAE conditioning rows.
-                encoder = MiniMaxH3TextEncoder(
-                    args.compact_root,
-                    dtype=mx.bfloat16,
-                    load_vision=keyframes is not None,
-                    verbose=True,
-                    config_path=args.text_config,
-                )
-                embeds, text_tags = encoder.encode(args.prompt, keyframes)
-                embeds = mx.array(embeds)
-                mx.eval(embeds)
-                if args.prompt_cache is not None:
-                    args.prompt_cache.parent.mkdir(parents=True, exist_ok=True)
-                    np.savez_compressed(
-                        args.prompt_cache,
-                        prompt=np.array(args.prompt),
-                        first_frame=np.array(str(args.first_frame) if args.first_frame else ""),
-                        embeds=np.array(embeds.astype(mx.float32)),
-                        text_tags=text_tags,
-                    )
-            del encoder
-        record.data["prompt_tokens"] = int(len(text_tags))
-        record.flush()
-        release()
+        segments = []
+        step_times = []
+        window_report = []
+        for index in range(chain):
+            label = "" if chain == 1 else f"w{index + 1}_"
+            if index == 0:
+                keyframe = base_keyframe
+                first_frame_key = str(args.first_frame) if args.first_frame else ""
+                prompt_cache = args.prompt_cache
+            else:
+                from PIL import Image
 
-        config = PipelineConfig()
-        latent_frames = video_latent_num_frames(frames)
-        latent_h, latent_w = args.height // 16, args.width // 16
-        audio_latents = audio_latent_num_frames(frames)
-        patch = (1, 2, 2)
-
-        # The keyframe is encoded while only the 5 GB video VAE is resident, before the DiT lands.
-        condition_rows = None
-        anchors: tuple[str, ...] = ()
-        if keyframes is not None:
-            anchors = ("first",)
-            with record.phase("keyframe_encode"):
-                keyframe_vae = load_compact_video_vae(args.compact_root / "video_vae.safetensors")
-                condition_rows = encode_keyframe_rows(
-                    keyframe_vae, keyframes, args.height, args.width, patch
-                )
-                mx.eval(condition_rows)
-                print(f"keyframe conditioning rows: {condition_rows.shape}")
-            del keyframe_vae
+                # The chain, in one line: the previous window's last decoded frame re-enters as this
+                # window's first-frame keyframe. The ordinary keyframe path VAE-encodes it,
+                # noises it to 0.999 and RoPE-anchors it to frame 0 of the new timeline, so
+                # nothing inside the denoiser knows it is in a chain. It is already on the
+                # canvas, so no resampling pass stands between one window and the next.
+                keyframe = Image.fromarray(segments[-1][0][-1])
+                first_frame_key = f"<chain window {index}>"
+                # The keyframe changes every window and its vision tokens with it, so a prompt cache
+                # keyed on (prompt, first frame) can only ever hit on window 1.
+                prompt_cache = None
+            started = time.perf_counter()
+            if chain > 1:
+                print(f"\n### window {index + 1}/{chain} ###", flush=True)
+            video, audio, sample_rate, window_steps = render_window(
+                args,
+                record,
+                label=label,
+                frames=frames,
+                # A fresh seed per window: identical starting noise under a changed keyframe
+                # correlates the windows' composition and camera motion, which is the one thing a
+                # chain must not do.
+                seed=args.seed + index,
+                keyframe=keyframe,
+                first_frame_key=first_frame_key,
+                prompt_cache=prompt_cache,
+            )
+            segments.append((video, audio))
+            step_times.extend(window_steps)
+            window_report.append(
+                {
+                    "window": index + 1,
+                    "seed": args.seed + index,
+                    "seconds": round(time.perf_counter() - started, 3),
+                    "keyframe": first_frame_key or None,
+                }
+            )
+            record.data["windows"] = window_report
+            record.flush()
+            if args.chain_keep_windows and chain > 1:
+                window_path = args.output.with_name(f"{args.output.stem}_w{index + 1}.mp4")
+                window_path.parent.mkdir(parents=True, exist_ok=True)
+                save_mp4(window_path, video, float(FPS), audio, sample_rate)
             release()
 
-        with record.phase("dit_load_bf16"):
-            dit = load_dit(args.dit, verbose=True)
-            patch = dit.config.patch_size
-
-        layout = build_packed_sequence(
-            text_tags, latent_frames, latent_h, latent_w, audio_latents, patch, anchors
-        )
-        print(
-            f"geometry: {args.width}x{args.height}, {frames} frames, "
-            f"{layout.sequence_length:,} packed rows",
-            flush=True,
-        )
-        record.data["packed_rows"] = int(layout.sequence_length)
-        record.data["video_rows"] = int(layout.video_indices.shape[0])
-        record.data["audio_rows"] = int(layout.audio_indices.shape[0])
-        record.flush()
-
-        with record.phase("adaln_cache_and_noise"):
-            video_sched, audio_sched = build_schedules(args.steps, config)
-            timestep_table, plan = row_timestep_plan(
-                layout, video_sched.timesteps, audio_sched.timesteps
-            )
-            cache = ModulationCache.build(dit, timestep_table, dtype=mx.bfloat16)
-            mx.eval(cache.tables)
-            freed = drop_adaln_weights(dit)
-            mx.clear_cache()
-            print(f"AdaLN cache {cache.nbytes()/1024**2:.1f} MiB; dropped {gb(freed):.2f} GiB")
-            # Draw order matches the reference pipeline: conditioning noise first, then video,
-            # then audio, so a seed reproduces the same run with and without the staged loader.
-            mx.random.seed(args.seed)
-            if condition_rows is not None:
-                condition_noise = mx.random.normal(condition_rows.shape).astype(mx.float32)
-                condition_rows = MiniMaxH3Scheduler(
-                    shift=config.sigma_shift_video
-                ).scale_noise(condition_rows, KEYFRAME_NOISE_AUG, condition_noise)
-            latents = mx.random.normal(
-                (1, dit.config.latents_dim, latent_frames, latent_h, latent_w)
-            ).astype(mx.float32)
-            video_rows = patchify_video_latents(latents, patch)
-            audio_rows = mx.random.normal(
-                (audio_latents * AUDIO_CHANNELS, dit.config.audio_latents_dim)
-            ).astype(mx.float32)
-            if condition_rows is not None:
-                video_rows = mx.concatenate([condition_rows, video_rows])
-            mx.eval(video_rows, audio_rows)
-
-        n_cond_v = layout.num_condition_video_rows
-
-        num_forwards = len(video_sched.timesteps)
-        step_cache = (
-            StepResidualCache(
-                args.step_cache, num_forwards, max_skip=args.step_cache_max_skip
-            )
-            if args.step_cache > 0 or args.step_cache_probe
-            else None
-        )
-
-        step_times = []
-        with record.phase("joint_denoise"):
-            for index, timestep in enumerate(video_sched.timesteps.tolist()):
-                started = time.perf_counter()
-                forward_args = (
-                    video_rows[None].astype(mx.bfloat16),
-                    audio_rows[None].astype(mx.bfloat16),
-                    embeds.astype(mx.bfloat16),
-                    timestep_table,
-                    plan[index],
-                    layout.token_tags,
-                    layout.position_ids,
-                    layout.video_indices,
-                    layout.audio_indices,
-                    layout.text_indices,
-                )
-
-                skip = False
-                if step_cache is not None:
-                    x, _, adaln_indices, _ = dit.pack_inputs(*forward_args)
-                    indicator = dit.skip_indicator(x, adaln_indices, cache.get(0))
-                    mx.eval(indicator)
-                    del x
-                    skip = step_cache.decide(index, indicator)
-
-                if skip:
-                    video_pred, audio_pred = step_cache.reuse(video_rows, audio_rows)
-                else:
-                    video_out, audio_out = dit(*forward_args, modulation_cache=cache)
-                    video_pred = video_out[0].astype(mx.float32)
-                    audio_pred = audio_out[0].astype(mx.float32)
-                    if step_cache is not None:
-                        step_cache.store(video_rows, audio_rows, video_pred, audio_pred)
-
-                # Only generated rows are written back; keyframe anchors survive untouched, so no
-                # masking is needed. Rebind rather than assign into a slice — the stepped result is
-                # a lazy graph over the very rows it would overwrite.
-                stepped_video = video_sched.step(
-                    video_pred[n_cond_v:], float(timestep), video_rows[n_cond_v:]
-                )
-                audio_rows = audio_sched.step(
-                    audio_pred,
-                    float(audio_sched.timesteps[index].item()),
-                    audio_rows,
-                )
-                video_rows = (
-                    mx.concatenate([video_rows[:n_cond_v], stepped_video])
-                    if n_cond_v
-                    else stepped_video
-                )
-                mx.eval(video_rows, audio_rows)
-                elapsed = time.perf_counter() - started
-                step_times.append(elapsed)
-                print(
-                    f"step {index+1}/{num_forwards}: {elapsed:.1f}s"
-                    f"{' [reused]' if skip else ''} "
-                    f"(active {gb(mx.get_active_memory()):.1f} GiB)",
-                    flush=True,
-                )
-        if step_cache is not None:
-            record.data["step_cache"] = step_cache.summary()
-            print(f"step cache: reused {step_cache.skipped}/{num_forwards} forwards")
-
-        mx.eval(video_rows, audio_rows)
-        del dit, cache, plan, timestep_table, video_sched, audio_sched
-        release()
-
-        with record.phase("video_vae_decode"):
-            video_vae = load_compact_video_vae(args.compact_root / "video_vae.safetensors")
-            video = decode_video(
-                video_vae, video_rows[n_cond_v:], frames, latent_frames, latent_h, latent_w, patch
-            )
-        del video_vae, video_rows
-        release()
-
-        with record.phase("audio_vae_decode"):
-            audio_vae = load_compact_audio_vae(args.compact_root / "audio_vae.safetensors")
-            audio = decode_audio(audio_vae, audio_rows, audio_latents, frames)
-            sample_rate = audio_vae.config.sampling_rate
-        del audio_vae, audio_rows
-        release()
-
-        with record.phase("encode_mux"):
+        with record.phase("encode_mux" if chain == 1 else "stitch_and_mux"):
             args.output.parent.mkdir(parents=True, exist_ok=True)
             playback = float(args.playback_fps or FPS)
-            save_mp4(
-                args.output,
-                video,
-                playback,
-                audio,
-                sample_rate,
-                audio_tempo=playback / FPS,
-            )
+            if chain > 1:
+                video, audio, seams = stitch_windows(
+                    segments, sample_rate, max(0.0, args.chain_audio_crossfade)
+                )
+                video = video[:delivered_frames]
+                audio = audio[:, : round(delivered_frames / FPS * sample_rate)]
+                record.data["seams"] = seams
+                print(
+                    f"stitched {chain} windows into {len(video)} frames "
+                    f"({len(video) / FPS:.2f} s) with {len(seams)} seam(s)",
+                    flush=True,
+                )
+            else:
+                video, audio = segments[0]
+            save_mp4(args.output, video, playback, audio, sample_rate, audio_tempo=playback / FPS)
 
         record.data.update(
             {
                 "status": "done",
                 "output": str(args.output),
+                "delivered_frames": int(len(video)),
+                "delivered_seconds": round(len(video) / FPS, 3),
                 "total_seconds": round(time.perf_counter() - total_started, 3),
                 "mean_denoise_step_seconds": round(float(np.mean(step_times)), 3),
                 "denoise_step_seconds": [round(value, 3) for value in step_times],
