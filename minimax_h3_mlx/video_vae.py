@@ -21,10 +21,35 @@ As in the DiT, ``attn.to_qkv`` is per-head interleaved and ``ff.w1`` is a fused 
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 
 import mlx.core as mx
 import mlx.nn as nn
+
+#: Spatial tiles pushed through the ViT decoder in one call. The decoder is per-item — attention
+#: never crosses the batch axis and the rotary grid is derived from a tile's own ``(d, h, w)`` — so
+#: stacking same-shaped tiles on the batch axis is exactly the arithmetic of decoding them one by
+#: one, with a fraction of the launches. A 768x448 clip is 8 tiles, so the default batches a whole
+#: clip in one call, which is what the PyTorch reference does. The cap exists because the fused
+#: SwiGLU projection is the widest activation and grows linearly with the batch.
+#: ``H3_VAE_BATCH=0`` (or 1) restores the one-call-per-tile loop.
+DEFAULT_DECODE_BATCH = 8
+
+
+def resolved_decode_batch() -> int:
+    """The decode batch a freshly built :class:`VideoVAE` will use, honouring ``H3_VAE_BATCH``.
+
+    Unparseable values are ignored rather than allowed to fail a render that is already
+    twenty minutes deep.
+    """
+    raw = os.environ.get("H3_VAE_BATCH")
+    if raw is None:
+        return DEFAULT_DECODE_BATCH
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        return DEFAULT_DECODE_BATCH
 
 
 @dataclass
@@ -461,6 +486,7 @@ class VideoVAE(nn.Module):
         self.tile_sample_min_width = 256
         self.tile_sample_min_overlap_height = 64
         self.tile_sample_min_overlap_width = 64
+        self.decode_batch = resolved_decode_batch()
 
     # -- tiling -----------------------------------------------------------------------------
 
@@ -543,6 +569,37 @@ class VideoVAE(nn.Module):
         ratio = self.config.spatial_compression_ratio
         return self._stitch_tiles(rows, [o // ratio for o in y_ov], [o // ratio for o in x_ov], 2, 3)
 
+    def _decode_tiles(self, tiles: list[mx.array]) -> list[mx.array]:
+        """Push every tile through the ViT decoder, batching same-shaped tiles into one call.
+
+        Tiles are grouped by shape — in practice :meth:`_split_tiles` makes them all identical, so
+        this is one group — and each group is cut into ``decode_batch``-sized slices. Grouping is
+        what makes the batching safe rather than merely convenient: the rotary grid a tile gets
+        depends on its ``(d, h, w)``, so only same-shaped tiles may share a call.
+        """
+        if self.decode_batch <= 1 or len(tiles) < 2:
+            return [self.decoder(self.post_quant_conv(tile)) for tile in tiles]
+
+        groups: dict[tuple[int, ...], list[int]] = {}
+        for index, tile in enumerate(tiles):
+            groups.setdefault(tuple(tile.shape[1:]), []).append(index)
+
+        out: list[mx.array] = [None] * len(tiles)  # type: ignore[list-item]
+        for members in groups.values():
+            for start in range(0, len(members), self.decode_batch):
+                part = members[start : start + self.decode_batch]
+                if len(part) == 1:
+                    out[part[0]] = self.decoder(self.post_quant_conv(tiles[part[0]]))
+                    continue
+                stacked = mx.concatenate([tiles[index] for index in part], axis=0)
+                decoded = self.decoder(self.post_quant_conv(stacked))
+                cursor = 0
+                for index in part:
+                    size = tiles[index].shape[0]
+                    out[index] = decoded[cursor : cursor + size]
+                    cursor += size
+        return out
+
     def _decode_clip(self, z: mx.array) -> mx.array:
         if not self.use_tiling:
             return self.decoder(self.post_quant_conv(z))
@@ -551,19 +608,20 @@ class VideoVAE(nn.Module):
         y_idx, y_len, y_ov = self._split_tiles(h, self.tile_sample_min_height, self.tile_sample_min_overlap_height)
         x_idx, x_len, x_ov = self._split_tiles(w, self.tile_sample_min_width, self.tile_sample_min_overlap_width)
 
-        rows = []
-        for i_pos, i_len in zip(y_idx, y_len):
-            row = []
-            for j_pos, j_len in zip(x_idx, x_len):
-                tile = z[
-                    :,
-                    :,
-                    i_pos // ratio : i_pos // ratio + i_len // ratio,
-                    j_pos // ratio : j_pos // ratio + j_len // ratio,
-                    :,
-                ]
-                row.append(self.decoder(self.post_quant_conv(tile)))
-            rows.append(row)
+        tiles = [
+            z[
+                :,
+                :,
+                i_pos // ratio : i_pos // ratio + i_len // ratio,
+                j_pos // ratio : j_pos // ratio + j_len // ratio,
+                :,
+            ]
+            for i_pos, i_len in zip(y_idx, y_len)
+            for j_pos, j_len in zip(x_idx, x_len)
+        ]
+        decoded = self._decode_tiles(tiles)
+        width = len(x_idx)
+        rows = [decoded[i * width : (i + 1) * width] for i in range(len(y_idx))]
         return self._stitch_tiles(rows, y_ov, x_ov, 2, 3)
 
     # -- public API (channels-first, matching the reference) --------------------------------

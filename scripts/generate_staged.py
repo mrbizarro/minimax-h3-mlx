@@ -44,6 +44,7 @@ from minimax_h3_mlx.pipeline import encode_keyframe_rows
 from minimax_h3_mlx.scheduler import MiniMaxH3Scheduler
 from minimax_h3_mlx.stepcache import StepResidualCache
 from minimax_h3_mlx.text_encoder import MiniMaxH3TextEncoder
+from minimax_h3_mlx.video_vae import resolved_decode_batch
 
 
 def gb(value: int) -> float:
@@ -217,6 +218,9 @@ def main() -> int:
         "step_cache_threshold": args.step_cache,
         "step_cache_max_skip": args.step_cache_max_skip,
         "playback_fps": args.playback_fps or FPS,
+        # Which video-VAE decode mode produced this run, so a metrics file is self-describing
+        # when someone compares decode phases across the campaign. 0/1 is the per-tile loop.
+        "vae_decode_batch": resolved_decode_batch(),
         "wired_gb": round(gb(wired_bytes), 3),
         "memory_limit_gb": round(gb(memory_bytes), 3),
         "device": device,
