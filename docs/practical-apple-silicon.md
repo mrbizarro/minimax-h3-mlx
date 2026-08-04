@@ -82,6 +82,60 @@ The wrapper advertises 5-15 seconds, but the transformer accepts any legal grid;
 constraint is the video decoder, which needs at least seven latent frames. That makes **22 pixel
 frames the true end-to-end minimum**, not 5.
 
+### Long clips: chained windows
+
+Duration in a single pass is quadratic — the attention term grows with the packed sequence, so the
+second five seconds of a clip costs more than the first. `--chain-windows N` renders N windows
+instead, each conditioned on the previous window's **last decoded frame** through the ordinary
+first-frame keyframe path, dropping the duplicate frame at the join. The marginal cost of each
+extra window is then flat.
+
+| Delivered | Route | Forwards | Total wall | Peak Metal |
+|---|---|---:|---:|---:|
+| 243 frames / 10.125 s | one dense pass | 15 | 36:12.1 | 42.635 GiB |
+| 243 frames / 10.125 s | **2 chained windows** | 8 per window | **17:04.9** | **40.254 GiB** |
+| 362 frames / 15.083 s | **3 chained windows** | 8 per window | **26:34.0** | **40.236 GiB** |
+
+The forward counts are not matched and the comparison is not a like-for-like speed claim: eight
+forwards is the validated setting at the five-second tier and fifteen at ten seconds, and chaining
+is what makes eight legitimate at ten seconds, because every pass is a five-second pass. Matched at
+fifteen forwards per window, the same 10 s chain projects to about 30:03 (1.20x). What chaining
+actually removes is the quadratic: a window that opens on a keyframe costs **8.6% more** than one
+that does not (+680 packed rows, plus the still's VAE encode and a text encode the prompt cache
+cannot serve), and that surcharge does not grow with clip length. Peak memory stops tracking
+duration at all — a chained clip peaks at its window's peak, whatever its length.
+
+Seams were measured, not assumed. On both clips the frame-to-frame luminance step **at the join**
+was 0.64-1.25x the median step of its own neighbourhood, and smaller than the largest ordinary
+step elsewhere in the same clip; audio is cross-faded over the one frame of real overlap the chain
+owns, which drops the sample step at the seam by 7.6-10.5x to about 0.01-0.06x the clip's own
+typical slew, with zero A/V drift.
+
+Three honest limitations:
+
+- **The camera can change direction at a seam.** A single still frame carries state, not momentum:
+  the next window cannot know which way the camera was travelling. There is no positional jump —
+  the discontinuity is in velocity.
+- **Every window gets the same prompt**, so a prompt that scripts a spoken line asks for that line
+  in each window, and it can be delivered once per window. Per-window prompts are the fix.
+- **Audio level is not matched across seams.** Windows generate their ambience independently; one
+  frame of overlap removes the click but cannot ramp a level change.
+
+```bash
+# 15 seconds as three windows, trimmed to an exact 362 frames
+./.venv/bin/python scripts/generate_staged.py '<prompt>' \
+  --dit ... --compact-root ... --text-config ... \
+  --frames 124 --height 448 --width 768 --steps 9 --seed 161616 \
+  --chain-windows 3 --chain-total-frames 362 \
+  --output ../outputs/long.mp4 --metrics ../metrics/long.json
+
+# grade the joins afterwards
+./.venv/bin/python scripts/seam_report.py ../outputs/long.mp4 \
+  --window-frames 124 --windows 3 -o ../outputs/long_seam.png
+```
+
+`--chain-windows 1` is the default and is the single-pass path unchanged.
+
 ## Reproduction
 
 Fetch only the files this path needs, into `<experiment-root>/models`:
