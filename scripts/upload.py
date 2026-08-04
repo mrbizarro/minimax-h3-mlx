@@ -45,12 +45,11 @@ library_name: mlx
 # {repo_name}
 
 MLX (Apple Silicon) build of the [**MiniMax-H3**](https://huggingface.co/{upstream}) diffusion
-transformer, quantized to **{bits}-bit** (group size {group_size}).
+transformer. {headline}
 
 > Powered by MiniMax H3.
 
-**These files are modified.** The transformer weights have been converted to MLX and quantized;
-they are not MiniMax's originals. Everything else about the model is unchanged.
+**These files are modified.** {modified_note} Everything else about the model is unchanged.
 
 ## What this is
 
@@ -75,16 +74,7 @@ This repository holds the **transformer only**. The VAEs and the text encoder co
 | on disk | {gb_on_disk} GB |
 | resident during generation | **{gb_resident} GB** |
 
-The gap is deliberate. ~13B of H3's 33B parameters are the per-block AdaLN projections, whose only
-input is the timestep embedding. For a fixed sampler schedule every modulation tensor a run needs is
-precomputed once into a small table, and the projections are then dropped — so they are on disk but
-never resident. The table scales with step count, not model size: measured at **145 MB for a 9-step
-schedule** and 745 MB for 40 steps, against the 26 GB it replaces.
-
-Those projections are quantized to **8-bit** here. That was measured, not assumed: quantizing them
-shifts the modulation table by **0.25%**, an order of magnitude less than the {bits}-bit core's own
-velocity error, and takes 12.2 GB off this download. (4-bit AdaLN is measurably worse — 0.77% on the
-table, 2.8% on its worst tensor — and is not used at any core width.)
+{precision_block}
 
 ## How the widths compare
 
@@ -132,15 +122,74 @@ The MLX port code is Apache-2.0 and lives at [{code_repo}]({code_repo}).
 """
 
 
-def build_card(repo: str, quant_meta: dict) -> str:
+ADALN_NOTE = """The gap is deliberate. ~13B of H3's 33B parameters are the per-block AdaLN projections, whose only
+input is the timestep embedding. For a fixed sampler schedule every modulation tensor a run needs is
+precomputed once into a small table, and the projections are then dropped — so they are on disk but
+never resident. The table scales with step count, not model size: measured at **145 MB for a 9-step
+schedule** and 745 MB for 40 steps, against the 26 GB it replaces."""
+
+QUANT_PRECISION = ADALN_NOTE + """
+
+Those projections are quantized to **8-bit** here. That was measured, not assumed: quantizing them
+shifts the modulation table by **0.25%**, an order of magnitude less than the {bits}-bit core's own
+velocity error, and takes 12.2 GB off this download. (4-bit AdaLN is measurably worse — 0.77% on the
+table, 2.8% on its worst tensor — and is not used at any core width.)"""
+
+BF16_PRECISION = ADALN_NOTE + """
+
+**Nothing here is quantized.** This is the faithful conversion, and it preserves the release's
+*mixed* precision rather than flattening it: MiniMax ships the two patch projections, the timestep
+MLP and both output heads in **float32** and everything else in bfloat16, and that split is kept
+intact. Casting those twelve tensors down to bfloat16 would be a downgrade from the release — the
+timestep MLP in particular feeds every block's modulation, so rounding it perturbs all 50 blocks at
+every sampling step.
+
+Use this as the quality reference, or as the base for further conversion. If you only want to
+generate and have the memory, it is the best output available; if you do not, the
+[8-bit build](https://huggingface.co/pipenetwork/MiniMax-H3-MLX-8bit) is 27.6 dB PSNR against it and
+roughly half the size."""
+
+F32_PRECISION = ADALN_NOTE + """
+
+**This build carries no more information than the
+[bf16 one](https://huggingface.co/pipenetwork/MiniMax-H3-MLX-bf16).** MiniMax's weights are bfloat16
+on disk, so upcasting to float32 is a lossless widening, not extra precision — you are downloading
+132.6 GB of data that fits losslessly in 66.3 GB. It is published for float32 fine-tuning and
+numerics work, where having the base already widened is convenient.
+
+If you only want to generate, take bf16 instead. If you want float32 *compute* from a smaller
+download, `load_dit(dtype=mx.float32)` upcasts at load time and gives an identical model."""
+
+
+def build_card(repo: str, meta: dict) -> str:
+    """Render the card for a quantized or an unquantized build."""
+    if meta.get("quantized") is False:
+        policy = meta.get("dtype_policy", "native")
+        if policy == "float32":
+            headline = "Unquantized, upcast to **float32**."
+            modified = "The transformer weights have been converted to MLX and widened to float32;"
+            precision = F32_PRECISION
+        else:
+            headline = "Unquantized, in the release's native **mixed bfloat16/float32** precision."
+            modified = "The transformer weights have been converted to MLX;"
+            precision = BF16_PRECISION
+        bits = group_size = "n/a"
+    else:
+        bits = meta.get("bits", "?")
+        group_size = meta.get("group_size", "?")
+        headline = f"Quantized to **{bits}-bit** (group size {group_size})."
+        modified = "The transformer weights have been converted to MLX and quantized;"
+        precision = QUANT_PRECISION
+
     return CARD.format(
         upstream=UPSTREAM,
         code_repo=CODE_REPO,
         repo_name=repo.split("/")[-1],
-        bits=quant_meta.get("bits", "?"),
-        group_size=quant_meta.get("group_size", "?"),
-        gb_on_disk=quant_meta.get("gb_on_disk", "?"),
-        gb_resident=quant_meta.get("gb_resident_after_adaln_drop", "?"),
+        headline=headline,
+        modified_note=modified + " they are not MiniMax's originals.",
+        precision_block=precision.format(bits=bits),
+        gb_on_disk=meta.get("gb_on_disk", "?"),
+        gb_resident=meta.get("gb_resident_after_adaln_drop", "?"),
     )
 
 
@@ -155,9 +204,13 @@ def main() -> int:
     args = parser.parse_args()
 
     directory = Path(args.dir)
-    meta_path = directory / "quant_config.json"
-    if not meta_path.exists():
-        print(f"error: {meta_path} not found — build with scripts/build_quant.py first")
+    meta_path = next(
+        (directory / n for n in ("quant_config.json", "build_config.json") if (directory / n).exists()),
+        None,
+    )
+    if meta_path is None:
+        print(f"error: no quant_config.json or build_config.json in {directory} — "
+              "build with scripts/build_quant.py or scripts/build_unquantized.py first")
         return 1
     quant_meta = json.loads(meta_path.read_text())
 

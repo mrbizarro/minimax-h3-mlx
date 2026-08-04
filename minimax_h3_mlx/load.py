@@ -209,10 +209,17 @@ def load_video_vae(model_dir: str | Path, strict: bool = True):
             unexpected.append(key)
             continue
         if tensor.ndim == 5:
-            # Channels-last conv weights. Materialize each one as it is produced: deferring 10 GB of
-            # transposes into a single graph overruns the Metal command-buffer timeout.
-            tensor = mx.contiguous(tensor.transpose(0, 2, 3, 4, 1))
-            mx.eval(tensor)
+            # Channels-last conv weights, materialized one at a time **on the CPU stream**.
+            #
+            # Deferring 10 GB of transposes into a single graph overruns the Metal command-buffer
+            # deadline outright. Doing them individually on the GPU is enough on an idle machine but
+            # still fails when something else is competing for the device — which is exactly when a
+            # user is most likely to be loading a model. The CPU stream has no such deadline. It
+            # trades some load time for not failing — a one-time cost on a path that otherwise
+            # aborts a multi-hour run at the last component.
+            with mx.stream(mx.cpu):
+                tensor = mx.contiguous(tensor.transpose(0, 2, 3, 4, 1))
+                mx.eval(tensor)
         weights[key] = tensor
 
     missing = sorted(expected - weights.keys())
