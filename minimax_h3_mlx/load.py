@@ -278,8 +278,11 @@ def load_compact_video_vae(path: str | Path, strict: bool = True):
             unexpected.append(key)
             continue
         if tensor.ndim == 5:
-            tensor = mx.contiguous(tensor.transpose(0, 2, 3, 4, 1))
-            mx.eval(tensor)
+            # Same hazard, same fix as `load_video_vae` above — and this is the loader the staged
+            # runner actually calls, so the hardening has to be here or it never runs.
+            with mx.stream(mx.cpu):
+                tensor = mx.contiguous(tensor.transpose(0, 2, 3, 4, 1))
+                mx.eval(tensor)
         weights[key] = tensor
 
     missing = sorted(expected - weights.keys())
