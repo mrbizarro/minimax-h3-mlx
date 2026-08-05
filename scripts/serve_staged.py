@@ -211,6 +211,10 @@ class ResidentEngine:
         mx.clear_cache()
 
     def free_vaes(self):
+        """Drop the VAEs unless residency was asked for -- otherwise ``--resident-vae`` would be a
+        flag that reloads them every job while still being billed for the peak."""
+        if self.opts.resident_vae:
+            return
         self.video_vae = None
         self.audio_vae = None
         gc.collect()
