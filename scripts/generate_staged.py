@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import sys
 import time
@@ -143,6 +144,53 @@ def decode_audio(model, rows, audio_latents: int, frames: int):
     return waveform[:, :samples].astype(np.float32)
 
 
+CHAIN_PROMPT_SEPARATOR = " ||| "
+
+
+def parse_chain_prompts(spec: str, windows: int) -> list[str]:
+    """Turn one ``--chain-prompts`` value into exactly one prompt per window.
+
+    A chain is a shot list, not one shot repeated: window *i* is a different moment of the same
+    scene, so it wants its own text conditioning. ``spec`` is either a ``' ||| '``-separated string
+    or the path to a ``.json`` file holding a list of strings — the same thing, spelled for a shell
+    or for a file when the prompts are long enough that quoting them stops being reasonable.
+
+    The count has to match the window count exactly. Silently recycling or truncating prompts is
+    how a shot list turns into a clip whose dialogue lands in the wrong window.
+    """
+    path = Path(spec)
+    if path.suffix.lower() == ".json":
+        if not path.exists():
+            raise ValueError(f"--chain-prompts names a .json file that does not exist: {path}")
+        try:
+            loaded = json.loads(path.read_text())
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"--chain-prompts file {path} is not valid JSON: {exc}") from exc
+        if not isinstance(loaded, list) or not all(isinstance(item, str) for item in loaded):
+            raise ValueError(
+                f"--chain-prompts file {path} must hold a JSON list of strings, one per window"
+            )
+        prompts = [item.strip() for item in loaded]
+        source = f"{path} holds"
+    else:
+        prompts = [part.strip() for part in spec.split(CHAIN_PROMPT_SEPARATOR.strip())]
+        source = "--chain-prompts holds"
+
+    if any(not prompt for prompt in prompts):
+        empty = [index + 1 for index, prompt in enumerate(prompts) if not prompt]
+        raise ValueError(
+            f"--chain-prompts has an empty prompt at position(s) {empty}; every window needs one. "
+            f"Separate prompts with '{CHAIN_PROMPT_SEPARATOR}'."
+        )
+    if len(prompts) != windows:
+        raise ValueError(
+            f"{source} {len(prompts)} prompt(s) but --chain-windows is {windows}. "
+            f"Give exactly one prompt per window, separated by '{CHAIN_PROMPT_SEPARATOR}' "
+            "(or a JSON list of that many strings)."
+        )
+    return prompts
+
+
 def stitch_windows(segments, sample_rate: int, crossfade_seconds: float):
     """Butt-join chained windows in pixel space and cross-fade their audio at every seam.
 
@@ -192,6 +240,7 @@ def render_window(
     record,
     *,
     label: str,
+    prompt: str,
     frames: int,
     seed: int,
     keyframe,
@@ -202,7 +251,8 @@ def render_window(
 
     Every large model is loaded, used and released inside this call, so a chain of windows runs in
     one process without the previous window's DiT still being resident. ``label`` prefixes the
-    phase names so a chained metrics file stays readable.
+    phase names so a chained metrics file stays readable. ``prompt`` is this window's own text —
+    a chain that scripts a line in one window must not encode that line in the others.
     """
     keyframes = [keyframe] if keyframe is not None else None
 
@@ -210,7 +260,9 @@ def render_window(
         with record.phase(f"{label}text_cache_load"):
             cached = np.load(prompt_cache, allow_pickle=False)
             cached_prompt = str(cached["prompt"].item())
-            if cached_prompt != args.prompt:
+            # Keyed on this window's prompt, not the run's: a per-window chain has no single
+            # prompt to cache against.
+            if cached_prompt != prompt:
                 raise ValueError("The prompt cache belongs to a different prompt.")
             cached_frame = str(cached["first_frame"].item()) if "first_frame" in cached else ""
             if cached_frame != first_frame_key:
@@ -229,21 +281,31 @@ def render_window(
                 verbose=True,
                 config_path=args.text_config,
             )
-            embeds, text_tags = encoder.encode(args.prompt, keyframes)
+            embeds, text_tags = encoder.encode(prompt, keyframes)
             embeds = mx.array(embeds)
             mx.eval(embeds)
             if prompt_cache is not None:
                 prompt_cache.parent.mkdir(parents=True, exist_ok=True)
                 np.savez_compressed(
                     prompt_cache,
-                    prompt=np.array(args.prompt),
+                    prompt=np.array(prompt),
                     first_frame=np.array(first_frame_key),
                     embeds=np.array(embeds.astype(mx.float32)),
                     text_tags=text_tags,
                 )
         del encoder
+    # A digest of the actual conditioning tensor, so "each window encoded its own prompt" is
+    # something a metrics file proves rather than something the runner claims.
+    digest = hashlib.sha256(np.array(embeds.astype(mx.float32)).tobytes()).hexdigest()[:16]
+    record.data[f"{label}prompt"] = prompt
     record.data[f"{label}prompt_tokens"] = int(len(text_tags))
+    record.data[f"{label}text_embed_sha256"] = digest
     record.flush()
+    print(
+        f"text conditioning: {len(text_tags)} tokens, embeds {tuple(embeds.shape)} sha {digest}\n"
+        f"  prompt: {prompt}",
+        flush=True,
+    )
     release()
 
     config = PipelineConfig()
@@ -412,7 +474,13 @@ def render_window(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("prompt")
+    parser.add_argument(
+        "prompt",
+        nargs="?",
+        default=None,
+        help="One prompt for the whole clip. Omit it and pass --chain-prompts to script a chain "
+        "window by window.",
+    )
     parser.add_argument("--dit", type=Path, required=True)
     parser.add_argument("--compact-root", type=Path, required=True)
     parser.add_argument("--text-config", type=Path, required=True)
@@ -471,6 +539,16 @@ def main() -> int:
         "1 (the default) is the untouched dense path.",
     )
     parser.add_argument(
+        "--chain-prompts",
+        default=None,
+        metavar="SPEC",
+        help="One prompt per window instead of one prompt for the clip: either N prompts separated "
+        f"by '{CHAIN_PROMPT_SEPARATOR}' or the path to a .json file holding a list of N strings, "
+        "where N is --chain-windows. Use it to script a line of dialogue in one window only — a "
+        "single prompt asks every window for that line, and each window delivers it. Mutually "
+        "exclusive with the positional prompt; absent, every window gets the positional prompt.",
+    )
+    parser.add_argument(
         "--chain-total-frames",
         type=int,
         default=None,
@@ -507,12 +585,33 @@ def main() -> int:
     if args.chain_total_frames is not None and not 1 <= args.chain_total_frames <= chain_frames:
         parser.error(f"--chain-total-frames must be in 1..{chain_frames} for this chain")
     delivered_frames = args.chain_total_frames or chain_frames
+
+    if args.chain_prompts is not None:
+        if args.prompt is not None:
+            parser.error(
+                "pass either one positional prompt or --chain-prompts, not both — with both, "
+                "which one a window should use is a guess"
+            )
+        try:
+            prompts = parse_chain_prompts(args.chain_prompts, chain)
+        except ValueError as exc:
+            parser.error(str(exc))
+    elif args.prompt is not None:
+        # Backward compatible by construction: without --chain-prompts every window sees the same
+        # text, which is exactly what the chain did before per-window prompts existed.
+        prompts = [args.prompt] * chain
+    else:
+        parser.error(
+            "a prompt is required: give one positionally, or one per window with --chain-prompts"
+        )
+
     device = mx.device_info()
     max_wired = int(device["max_recommended_working_set_size"])
     wired_bytes = min(int(args.wired_gb * 1024**3), max_wired - 1024**2)
     memory_bytes = min(int(args.memory_gb * 1024**3), int(device["memory_size"]) - 1024**3)
     settings = {
-        "prompt": args.prompt,
+        "prompt": prompts[0],
+        "chain_prompts": prompts if args.chain_prompts is not None else None,
         "dit": str(args.dit),
         "compact_root": str(args.compact_root),
         "prompt_cache": str(args.prompt_cache) if args.prompt_cache else None,
@@ -578,7 +677,8 @@ def main() -> int:
                 keyframe = Image.fromarray(segments[-1][0][-1])
                 first_frame_key = f"<chain window {index}>"
                 # The keyframe changes every window and its vision tokens with it, so a prompt cache
-                # keyed on (prompt, first frame) can only ever hit on window 1.
+                # keyed on (prompt, first frame) can only ever hit on window 1 — per-window prompts
+                # do not change that, they only give the cache a second reason to miss.
                 prompt_cache = None
             started = time.perf_counter()
             if chain > 1:
@@ -587,6 +687,7 @@ def main() -> int:
                 args,
                 record,
                 label=label,
+                prompt=prompts[index],
                 frames=frames,
                 # A fresh seed per window: identical starting noise under a changed keyframe
                 # correlates the windows' composition and camera motion, which is the one thing a
@@ -604,6 +705,7 @@ def main() -> int:
                     "seed": args.seed + index,
                     "seconds": round(time.perf_counter() - started, 3),
                     "keyframe": first_frame_key or None,
+                    "prompt": prompts[index],
                 }
             )
             record.data["windows"] = window_report

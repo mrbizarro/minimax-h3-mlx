@@ -111,19 +111,28 @@ step elsewhere in the same clip; audio is cross-faded over the one frame of real
 owns, which drops the sample step at the seam by 7.6-10.5x to about 0.01-0.06x the clip's own
 typical slew, with zero A/V drift.
 
-Three honest limitations:
+Two honest limitations:
 
 - **The camera can change direction at a seam.** A single still frame carries state, not momentum:
   the next window cannot know which way the camera was travelling. There is no positional jump —
   the discontinuity is in velocity.
-- **Every window gets the same prompt**, so a prompt that scripts a spoken line asks for that line
-  in each window, and it can be delivered once per window. Per-window prompts are the fix.
 - **Audio level is not matched across seams.** Windows generate their ambience independently; one
   frame of overlap removes the click but cannot ramp a level change.
 
+### A chain is a shot list, not one shot repeated
+
+One prompt for the whole clip asks **every** window for whatever that prompt describes, so a
+scripted line of dialogue is delivered once per window — a three-window clip says it three times.
+`--chain-prompts` gives window *i* prompt *i*, each text-encoded on its own, so the line is written
+into the window that should carry it and nowhere else. Pass N prompts separated by ` ||| `, or the
+path to a `.json` file holding a list of N strings; N must equal `--chain-windows` or the run
+refuses to start. Without the flag every window gets the positional prompt, exactly as before.
+
 ```bash
-# 15 seconds as three windows, trimmed to an exact 362 frames
-./.venv/bin/python scripts/generate_staged.py '<prompt>' \
+# 15 seconds as three windows, trimmed to an exact 362 frames — one prompt per window,
+# with the spoken line scripted only into the last
+./.venv/bin/python scripts/generate_staged.py \
+  --chain-prompts '<walks toward camera> ||| <stops and looks around> ||| <grins and says: ...>' \
   --dit ... --compact-root ... --text-config ... \
   --frames 124 --height 448 --width 768 --steps 9 --seed 161616 \
   --chain-windows 3 --chain-total-frames 362 \
