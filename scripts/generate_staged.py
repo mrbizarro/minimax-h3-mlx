@@ -448,6 +448,46 @@ def render_window(
         print(f"step cache: reused {step_cache.skipped}/{num_forwards} forwards")
 
     mx.eval(video_rows, audio_rows)
+    stage_a_cache = getattr(args, "save_stage_a", None)
+    if stage_a_cache is not None:
+        # Written before the VAE ever runs: the clean packed rows are the expensive artefact, and a
+        # second pass wants them, not pixels. Conditioning rows are deliberately excluded — they
+        # belong to this canvas's grid, and a refine at another canvas must rebuild them.
+        with record.phase(f"{label}stage_a_save"):
+            from minimax_h3_mlx.stage_cache import save_stage_a
+
+            stored = save_stage_a(
+                stage_a_cache,
+                video_rows=np.array(video_rows[n_cond_v:].astype(mx.float32)),
+                audio_rows=np.array(audio_rows.astype(mx.float32)),
+                embeds=np.array(embeds.astype(mx.float32)),
+                text_tags=np.asarray(text_tags),
+                meta={
+                    "prompt": prompt,
+                    "seed": int(seed),
+                    "frames": int(frames),
+                    "height": int(args.height),
+                    "width": int(args.width),
+                    "latent_frames": int(latent_frames),
+                    "latent_h": int(latent_h),
+                    "latent_w": int(latent_w),
+                    "audio_latents": int(audio_latents),
+                    "patch": [int(value) for value in patch],
+                    "latents_dim": int(dit.config.latents_dim),
+                    "forwards": int(num_forwards),
+                    "first_frame": first_frame_key,
+                    "text_embed_sha256": digest,
+                },
+            )
+            record.data[f"{label}stage_a_cache"] = {
+                "path": str(stage_a_cache),
+                "digests": stored["digests"],
+                "shapes": stored["shapes"],
+            }
+            record.flush()
+            print(f"stage-A cache: {stage_a_cache}", flush=True)
+            for name, value in stored["digests"].items():
+                print(f"  {name} {tuple(stored['shapes'][name])} sha256 {value[:16]}", flush=True)
     del dit, cache, plan, timestep_table, video_sched, audio_sched
     release()
 
@@ -494,6 +534,30 @@ def main() -> int:
     )
     parser.add_argument("-o", "--output", type=Path, required=True)
     parser.add_argument("--metrics", type=Path, required=True)
+    parser.add_argument(
+        "--frames-dir",
+        type=Path,
+        default=None,
+        help="Also write the delivered clip's frames as lossless PNGs here. An mp4 is the only "
+        "artefact the runner leaves behind, so every downstream step (upscaling, grading, a second "
+        "encode) starts from 4:2:0 and one generation of x264 loss. This is the escape hatch.",
+    )
+    parser.add_argument(
+        "--save-stage-a",
+        type=Path,
+        default=None,
+        metavar="NPZ",
+        help="Write the clean Stage-A packed rows (generated video rows, frozen audio rows, text "
+        "conditioning) to NPZ before decoding. A second pass — hires_refine.py, a re-decode, a "
+        "resumed render — then costs its own forwards instead of the whole first pass again.",
+    )
+    parser.add_argument(
+        "--crf",
+        type=int,
+        default=18,
+        help="x264 quality for the delivered mp4 (and the per-window previews). Lower is better; "
+        "0 is lossless.",
+    )
     parser.add_argument("--frames", type=int, default=22, help="snapped up to the 17n+5 grid")
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=448)
@@ -579,6 +643,11 @@ def main() -> int:
         parser.error("--chain-windows must be at least 1")
     if args.chain_windows > 1 and args.playback_fps is not None:
         parser.error("--chain-windows and --playback-fps do not compose; the seam maths is 24 fps")
+    if args.chain_windows > 1 and args.save_stage_a is not None:
+        parser.error(
+            "--save-stage-a holds one window's latents; with a chain every window would overwrite "
+            "the last. Cache a single-window render."
+        )
     frames = align_num_frames(args.frames)
     chain = args.chain_windows
     chain_frames = frames + (chain - 1) * (frames - 1)
@@ -615,6 +684,7 @@ def main() -> int:
         "dit": str(args.dit),
         "compact_root": str(args.compact_root),
         "prompt_cache": str(args.prompt_cache) if args.prompt_cache else None,
+        "save_stage_a": str(args.save_stage_a) if args.save_stage_a else None,
         "frames": frames,
         "height": args.height,
         "width": args.width,
@@ -713,7 +783,7 @@ def main() -> int:
             if args.chain_keep_windows and chain > 1:
                 window_path = args.output.with_name(f"{args.output.stem}_w{index + 1}.mp4")
                 window_path.parent.mkdir(parents=True, exist_ok=True)
-                save_mp4(window_path, video, float(FPS), audio, sample_rate)
+                save_mp4(window_path, video, float(FPS), audio, sample_rate, crf=args.crf)
             release()
 
         with record.phase("encode_mux" if chain == 1 else "stitch_and_mux"):
@@ -733,7 +803,20 @@ def main() -> int:
                 )
             else:
                 video, audio = segments[0]
-            save_mp4(args.output, video, playback, audio, sample_rate, audio_tempo=playback / FPS)
+            save_mp4(
+                args.output,
+                video,
+                playback,
+                audio,
+                sample_rate,
+                crf=args.crf,
+                audio_tempo=playback / FPS,
+            )
+            if args.frames_dir is not None:
+                from minimax_h3_mlx.media import save_frames
+
+                save_frames(args.frames_dir, video)
+                print(f"wrote {len(video)} lossless frames to {args.frames_dir}", flush=True)
 
         record.data.update(
             {
