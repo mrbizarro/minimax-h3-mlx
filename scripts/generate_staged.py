@@ -332,6 +332,17 @@ def render_window(
     with record.phase(f"{label}dit_load_bf16"):
         dit = load_dit(args.dit, verbose=True)
         patch = dit.config.patch_size
+        lora_spec = getattr(args, "lora", None)
+        if lora_spec:
+            from minimax_h3_mlx import lora as lora_mod
+
+            lora_mod.AUDIT = bool(getattr(args, "lora_audit", False))
+            lora_path, lora_scale = lora_mod.parse_spec(lora_spec)
+            lora_report = lora_mod.apply_lora(
+                dit, lora_path, lora_scale, mode=getattr(args, "lora_mode", "runtime"), verbose=True
+            )
+            record.data[f"{label}lora"] = lora_report.summary()
+            record.flush()
 
     layout = build_packed_sequence(
         text_tags, latent_frames, latent_h, latent_w, audio_latents, patch, anchors
@@ -353,6 +364,14 @@ def render_window(
         )
         cache = ModulationCache.build(dit, timestep_table, dtype=mx.bfloat16)
         mx.eval(cache.tables)
+        if getattr(args, "lora", None) and getattr(args, "lora_adaln", None):
+            from minimax_h3_mlx import lora as lora_mod
+
+            lora_path, lora_scale = lora_mod.parse_spec(args.lora)
+            record.data[f"{label}lora_adaln"] = lora_mod.absorb_adaln_lora(
+                dit, cache, lora_path, args.lora_adaln, lora_scale, verbose=True
+            )
+            record.flush()
         freed = drop_adaln_weights(dit)
         mx.clear_cache()
         print(f"AdaLN cache {cache.nbytes()/1024**2:.1f} MiB; dropped {gb(freed):.2f} GiB")
@@ -443,6 +462,26 @@ def render_window(
                 f"(active {gb(mx.get_active_memory()):.1f} GiB)",
                 flush=True,
             )
+            if index == 0 and getattr(args, "lora_audit", False) and getattr(args, "lora", None):
+                from minimax_h3_mlx import lora as lora_mod
+
+                ratios = lora_mod.audit_output_scale(dit, limit=0)
+                if ratios:
+                    values = [r for _, r in ratios]
+                    record.data[f"{label}lora_output_ratio"] = {
+                        "n": len(values),
+                        "median": float(np.median(values)),
+                        "min": float(np.min(values)),
+                        "max": float(np.max(values)),
+                    }
+                    print(
+                        f"lora |delta|/|base| on real activations: median {np.median(values):.3e}, "
+                        f"min {np.min(values):.3e}, max {np.max(values):.3e} over {len(values)} layers "
+                        f"(bf16 residual ULP is 3.9e-3)",
+                        flush=True,
+                    )
+                    for name, ratio in ratios[:4]:
+                        print(f"    {name}: {ratio:.3e}", flush=True)
     if step_cache is not None:
         record.data[f"{label}step_cache"] = step_cache.summary()
         print(f"step cache: reused {step_cache.skipped}/{num_forwards} forwards")
@@ -562,6 +601,35 @@ def main() -> int:
     parser.add_argument("--height", type=int, default=256)
     parser.add_argument("--width", type=int, default=448)
     parser.add_argument("--steps", type=int, default=9, help="sigma points; forwards = points - 1")
+    parser.add_argument(
+        "--lora",
+        default=None,
+        metavar="PATH[:SCALE]",
+        help="Apply a low-rank adapter to the DiT. SCALE defaults to 1.0 (these checkpoints ship "
+        "alpha == rank); SCALE 0 is a strict no-op and renders bit-identically to no --lora.",
+    )
+    parser.add_argument(
+        "--lora-mode",
+        choices=("runtime", "fuse"),
+        default="runtime",
+        help="'runtime' keeps the low-rank product as its own matmul (~1.5%% of a linear's FLOPs). "
+        "'fuse' merges W += scale*(B@A) into the base weight at load — measured to lose ~87%% of "
+        "this update to bfloat16 rounding, so it exists as a control arm, not a fast path.",
+    )
+    parser.add_argument(
+        "--lora-adaln",
+        type=Path,
+        default=None,
+        metavar="TIME_EMBEDDER",
+        help="Also apply the LoRA's adaLN modules, which the pruned checkpoint cannot wrap. Needs "
+        "the upstream time_embedder tensors (scripts/fetch_time_embedder.py); the delta is exact "
+        "and is folded into the precomputed modulation cache, so it costs nothing per forward.",
+    )
+    parser.add_argument(
+        "--lora-audit",
+        action="store_true",
+        help="Record |lora_out|/|base_out| on the first forward, per wrapped layer.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--wired-gb", type=float, default=50.0)
     parser.add_argument("--memory-gb", type=float, default=58.0)
