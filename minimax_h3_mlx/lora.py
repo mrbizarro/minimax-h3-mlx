@@ -104,16 +104,26 @@ def parse_spec(spec: str) -> tuple[Path, float]:
     return Path(text), 1.0
 
 
+# Redistributions for other runtimes namespace the DiT under their own wrapper. Stripping a known
+# prefix is safe because the suffix still has to match a module in our tree to be applied at all.
+KNOWN_PREFIXES = ("diffusion_model.", "transformer.", "model.diffusion_model.")
+
+
 def load_pairs(path: str | Path) -> dict[str, tuple[mx.array, mx.array]]:
     """Read a LoRA safetensors into ``{module_name: (A, B)}``, A ``[r, in]``, B ``[out, r]``."""
     raw = mx.load(str(path))
     names = sorted({k[: -len(LORA_A)] for k in raw if k.endswith(LORA_A)})
+    prefix = ""
+    for candidate in sorted(KNOWN_PREFIXES, key=len, reverse=True):
+        if names and all(n.startswith(candidate) for n in names):
+            prefix = candidate
+            break
     pairs: dict[str, tuple[mx.array, mx.array]] = {}
     for name in names:
         a, b = raw.get(name + LORA_A), raw.get(name + LORA_B)
         if a is None or b is None:
             continue
-        pairs[name] = (a, b)
+        pairs[name[len(prefix):]] = (a, b)
     return pairs
 
 
@@ -313,7 +323,10 @@ def absorb_adaln_lora(
     pairs = load_pairs(path)
     adaln = {k: v for k, v in pairs.items() if k.endswith(ADALN_SUFFIX)}
     if not adaln:
-        return {"blocks": 0, "final": False, "scale": scale}
+        if verbose:
+            print("adaLN LoRA: this file carries no adaln_proj pairs — nothing to absorb. "
+                  "(Re-distributions converted for pruned runtimes drop them.)", flush=True)
+        return {"blocks": 0, "final": False, "scale": scale, "reason": "no adaln pairs in file"}
 
     hidden = dit.config.hidden_size
     st = silu_temb(cache.timesteps, embedder_path)          # (T, 2688) float32
