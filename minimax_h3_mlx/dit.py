@@ -234,6 +234,12 @@ class FinalLayer(nn.Module):
     def norm_out(self, x: mx.array, temb: mx.array, timestep_indices: mx.array) -> mx.array:
         h = nn.silu(temb) if self.adaln_proj.apply_silu else temb
         h = self.adaln_proj.linear(h.astype(param_dtype(self.adaln_proj.linear)))
+        # A low-rank adapter on this projection cannot ride the module (the pruned checkpoint feeds
+        # it a 64-d curve, not the 2688-d embedding the adapter expects), so its per-timestep delta
+        # is parked here by `lora.absorb_adaln_lora`. Rows align with `temb`.
+        delta = getattr(self.adaln_proj, "lora_delta", None)
+        if delta is not None:
+            h = (h.astype(mx.float32) + delta).astype(h.dtype)
         shift, scale = h[..., : self.hidden_size], h[..., self.hidden_size :]
         x = self.norm(x)
         return x * (1.0 + scale[timestep_indices]) + shift[timestep_indices]

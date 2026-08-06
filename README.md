@@ -113,6 +113,70 @@ does not reduce. At 5 s the linear layers are ~42% of the work, at 15 s ~20%, so
 worth roughly 1.2-1.4x end-to-end — useful for *fitting* the model on a smaller Mac, not for making
 generation quick.
 
+## Turbo LoRA: 4-step sampling
+
+[`larryvrh/MiniMax-H3-Turbo-Lora`](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora)
+(**Apache-2.0**) is a step-distillation adapter that makes joint audio-video usable at **4 sampling
+steps = 3 forwards** instead of the 9 this runner defaults to. Measured here at 1152x640 / 124
+frames on a 64 GB M4 Max: **19:26 -> ~11 min**, per-forward cost unchanged, peak +0.7 GiB.
+
+```bash
+python scripts/generate_staged.py "<prompt>" \
+  --dit ... --compact-root ... --text-config ... \
+  --steps 4 \
+  --lora   /path/to/minimax_h3_turbo_4step_ema_ckpt500.safetensors \
+  --lora-adaln /path/to/upstream_time_embedder.safetensors \
+  -o out.mp4 --metrics out.json
+```
+
+**Which file.** Use larryvrh's own **`minimax_h3_turbo_4step_ema_ckpt500.safetensors`** (744 MB).
+Third-party ComfyUI conversions are bit-exact subsets that *drop* the 51 adaLN pairs this runner
+can apply, so they are strictly less than the original here. The non-EMA `ckpt500` is sharper but
+over-etches speculars and runs the audio to -0.3 dB; the EMA is the one to ship.
+
+**The second file.** `--lora-adaln` needs the upstream `time_embedder`, four tensors this
+checkpoint lineage does not carry (see below). Fetch it once — **63 MB pulled by HTTP range out of
+a 66 GB release**, not a full download:
+
+```bash
+python scripts/fetch_time_embedder.py --out /path/to/upstream_time_embedder.safetensors
+python scripts/verify_time_embedder.py   # optional: proves it is the right tensor, residual ~4e-12
+```
+
+Both downloads are the user's to make. **No weights are redistributed by this repo.**
+
+### Three things that are not obvious
+
+1. **The fused qkv rows are ordered differently in the two lineages.** MiniMaxAI's release (and so
+   this port) stores `attn.qkv_proj` per-head interleaved, `(heads, 3, head_dim)`; the ComfyUI
+   definition the LoRA was trained through splits contiguously, `(3, heads, head_dim)`. Applying
+   `lora_B` unpermuted scrambles the update across heads and presents as *"the LoRA does nothing
+   good"* rather than as an error. `lora._permute_qkv_rows` fixes it at load and the count of
+   re-ordered row blocks is printed every run. `scripts/lora_layout_probe.py` decides the layout
+   from the weights themselves (ANOVA on row norms) rather than from anyone's docstring.
+
+2. **Fusing the update into the bf16 base destroys most of it.** The delta is ~3.4e-4 of the weight
+   it rides on; bfloat16's relative ULP is 3.9e-3. `scripts/lora_numerics.py` measures ~13 % of the
+   update surviving the single rounding. So the default is `--lora-mode runtime`, a low-rank matmul
+   kept out of the weight, at ~+2.3 % per forward on a small canvas and below noise on a large one.
+   `--lora-mode fuse` is kept only as the honest control arm.
+
+3. **The 51 adaLN modules need a tensor the pruned checkpoint dropped.** DeepBeepMeep's export
+   replaces the `[96768, 2688]` per-block timestep projection with `[96768, 64]` over a sampled
+   rank-64 curve, so the adapter's `[16, 2688]` `lora_A` has no input to consume. What those modules
+   contribute depends on the timestep alone, so `lora.absorb_adaln_lora` folds their exact delta
+   into the precomputed modulation cache — **zero per-forward cost** — given the recovered
+   `time_embedder`. Without `--lora-adaln` they are reported as skipped, with the reason, never
+   silently dropped.
+
+`--steps 4` without `--lora` is not broken, it is *unresolved*: structure is in the right place and
+detail is not. That is the honest floor the adapter is measured against.
+
+**Why 4 steps does not blow up the audio here.** H3 runs video on sigma shift 12 and audio on shift
+3, and stock single-schedule samplers approximate that with one clock — an approximation that
+degrades as steps fall (2.5x overshoot on the last audio step at 4 forwards). This runner has always
+been dual-clock; `scripts/dual_clock_audit.py` checks it arithmetically against the reference map.
+
 ## Status
 
 | Piece | State |
@@ -226,6 +290,7 @@ minimax_h3_mlx/
   scheduler.py   rectified-flow Euler with exponential sigma shift
   packing.py     packed-sequence geometry, patchify/unpatchify, row timesteps
   load.py        checkpoint loading, mixed fp32/bf16 split preserved
+  lora.py        low-rank adapters: qkv row permutation, adaLN absorption
   video_vae.py   causal 3D CNN encoder + 36-layer ViT decoder, tiled
   audio_vae.py   DAC encoder + attention projection + BigVGAN decoder
   text_encoder.py Qwen3-VL-32B conditioner, truncated to the 50 layers H3 reads
