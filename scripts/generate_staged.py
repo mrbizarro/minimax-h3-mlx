@@ -197,6 +197,26 @@ def spread_joint_draft_clock(layout, text_rows: int, scale: float) -> None:
 
 CHAIN_PROMPT_SEPARATOR = " ||| "
 
+# The shipped preview lengths all keep H3's native 24 fps motion/audio clock. Three and five
+# seconds use one legal 17n+5 window; ten and fifteen seconds extend the approved five-second
+# window through the ordinary first-frame chain and trim only the final tail. Nothing here is
+# consulted unless --draft-seconds is explicit.
+DRAFT_DURATION_PRESETS = {
+    3: (73, 1, None),
+    5: (124, 1, None),
+    10: (124, 2, 240),
+    15: (124, 3, 360),
+}
+
+
+def draft_duration_plan(seconds: int) -> tuple[int, int, int | None]:
+    """Return (native frames per window, windows, delivered frames) for a draft preset."""
+    try:
+        return DRAFT_DURATION_PRESETS[seconds]
+    except KeyError as exc:
+        choices = ", ".join(str(value) for value in DRAFT_DURATION_PRESETS)
+        raise ValueError(f"draft length must be one of {choices} seconds") from exc
+
 
 def parse_chain_prompts(spec: str, windows: int) -> list[str]:
     """Turn one ``--chain-prompts`` value into exactly one prompt per window.
@@ -792,6 +812,16 @@ def main() -> int:
         help="Maximum LRU entries per draft cache class (default: 50).",
     )
     parser.add_argument(
+        "--draft-seconds",
+        type=int,
+        choices=tuple(DRAFT_DURATION_PRESETS),
+        default=None,
+        metavar="SECONDS",
+        help="Recommended native-motion TAE preset: 3/5 seconds use one H3 window; 10/15 "
+        "seconds use two/three conditioned windows and trim to exactly 240/360 frames. This "
+        "overrides --frames and is only legal with --draft-decode tae.",
+    )
+    parser.add_argument(
         "--first-frame",
         type=Path,
         default=None,
@@ -961,6 +991,23 @@ def main() -> int:
         parser.error("--draft-cache-dir is draft-only; pass --draft-decode tae")
     if args.draft_cache_limit < 1:
         parser.error("--draft-cache-limit must be at least 1")
+    if args.draft_seconds is not None:
+        if args.draft_decode != "tae":
+            parser.error("--draft-seconds is draft-only; pass --draft-decode tae")
+        if args.draft_fps is not None or args.playback_fps is not None:
+            parser.error("--draft-seconds keeps the native 24 fps clock; do not pass an fps flag")
+        if args.chain_windows != 1 or args.chain_total_frames is not None:
+            parser.error(
+                "--draft-seconds owns the window count and exact trim; do not pass manual chain "
+                "geometry"
+            )
+        args.frames, args.chain_windows, args.chain_total_frames = draft_duration_plan(
+            args.draft_seconds
+        )
+        if not args.output.stem.endswith(f"_{args.draft_seconds}s"):
+            args.output = args.output.with_name(
+                f"{args.output.stem}_{args.draft_seconds}s{args.output.suffix}"
+            )
     if args.draft_fps is not None and args.draft_decode != "tae":
         parser.error("--draft-fps is draft-only; pass --draft-decode tae")
     if args.draft_fps is not None and args.playback_fps is not None:
@@ -1037,6 +1084,7 @@ def main() -> int:
         "tae_checkpoint": str(args.tae_checkpoint) if args.tae_checkpoint else None,
         "draft_cache_dir": str(args.draft_cache_dir) if args.draft_cache_dir else None,
         "draft_cache_limit": args.draft_cache_limit if args.draft_cache_dir else None,
+        "draft_seconds": args.draft_seconds,
         "save_stage_a": str(args.save_stage_a) if args.save_stage_a else None,
         "frames": frames,
         "delivery_frames": delivered_frames,

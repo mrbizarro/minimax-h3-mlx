@@ -43,6 +43,49 @@ The selected draft-specific arguments are:
 The runner generates and decodes all 124 H3 frames and native full-duration audio. No cadence or
 audio-timing transform is part of the recommended path.
 
+Recommended duration presets are exposed as `--draft-seconds 3`, `5`, `10`, or `15`. The short
+presets use one native H3 window (73 or 124 frames). Ten and fifteen seconds use two or three
+124-frame windows, condition each continuation on the preceding last frame, drop the duplicate
+join frame, cross-fade one frame of audio at each seam, and trim to exactly 240 or 360 frames.
+The duration flag is rejected outside the explicit TAE draft path.
+
+## Native 10- and 15-second drafts
+
+The long presets preserve the chosen tier's actual motion rate and joint audio clock. They do not
+slow, duplicate, interpolate, or time-stretch generated material. Each later window receives the
+last decoded frame of the preceding window through H3's normal first-frame conditioning path and
+uses a fresh seed. A shot list can give every window its own prompt, avoiding repeated dialogue.
+
+Measured on the same 640x384 four-sigma turbo-LoRA recipe:
+
+| Preset | Native windows | Delivered media | Wall | A/V drift | Visual seam step |
+|---|---:|---:|---:|---:|---:|
+| 5 seconds | 1 | 124f / 5.167s | 127.882s | native | n/a |
+| 10 seconds | 2 | 240f / 10.000s | **263.166s** | 0.00ms | 1.95x local median |
+| 15 seconds | 3 | 360f / 15.000s | **397.116s** | 0.00ms | 1.95x / 1.98x local median |
+
+`ffprobe` reports exactly 24 fps and exactly 10.000/15.000 seconds for both the H.264 and AAC
+streams. Audio uses a 1,333-sample (one-frame) equal-power cross-fade. The measured sample jump at
+every seam rounded to 0.00x the clip's p99.9 sample step, so there is no seam click. The visual
+steps are noticeable under numeric comparison but small in the seam strips: identity, framing and
+motion direction remain continuous.
+
+The 10-second repeat took 126.672s for window 1 and 134.763s for the initially uncached second
+window. During the 15-second run, the first two windows hit both text and keyframe caches and took
+128.156s / 129.171s; the new third window took 137.161s including its one-time 7.312s text encode
+and 1.366s keyframe encode. Window 1 and window 2 each produced identical H.264 stream hashes in
+the 10- and 15-second runs, confirming deterministic repeat generation.
+
+Artifacts:
+
+- 10-second clip: `opt_out/draft_speed/native_chain_10s.mp4`
+- 10-second metrics: `opt_metrics/draft_speed/native_chain_10s.json`
+- 10-second seam strip: `opt_out/draft_speed/native_chain_10s_seam_f124.png`
+- 15-second clip: `opt_out/draft_speed/native_chain_15s.mp4`
+- 15-second metrics: `opt_metrics/draft_speed/native_chain_15s.json`
+- 15-second seam strips: `opt_out/draft_speed/native_chain_15s_seam_f124.png` and
+  `opt_out/draft_speed/native_chain_15s_seam_f247.png`
+
 ## Cheap latent compatibility gate
 
 The requested note, `notes/TR1DAE_NODE.md`, is a study of the Tr1dae latent *upscaler*, not a TAE

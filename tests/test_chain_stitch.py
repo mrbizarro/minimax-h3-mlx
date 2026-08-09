@@ -19,7 +19,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from generate_staged import parse_chain_prompts, stitch_windows  # noqa: E402
+from generate_staged import draft_duration_plan, parse_chain_prompts, stitch_windows  # noqa: E402
 from minimax_h3_mlx.packing import FPS  # noqa: E402
 
 SAMPLE_RATE = 32000
@@ -117,6 +117,21 @@ def prompt_tests() -> bool:
 def main() -> int:
     passed = True
     frames = 124
+
+    passed &= check(
+        "3-second draft uses the lower native grid", draft_duration_plan(3) == (73, 1, None)
+    )
+    passed &= check(
+        "5-second draft is the approved native grid", draft_duration_plan(5) == (124, 1, None)
+    )
+    passed &= check(
+        "10-second draft is two windows trimmed to 240",
+        draft_duration_plan(10) == (124, 2, 240),
+    )
+    passed &= check(
+        "15-second draft is three windows trimmed to 360",
+        draft_duration_plan(15) == (124, 3, 360),
+    )
 
     for windows in (2, 3):
         segments = [window(frames, 10 * (i + 1), 0.4 * i, seed=i) for i in range(windows)]
