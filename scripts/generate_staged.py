@@ -134,6 +134,18 @@ def decode_video(model, rows, frames: int, latent_frames: int, latent_h: int, la
     return (decoded * 255.0 + 0.5).astype(np.uint8)
 
 
+def decode_video_tae(
+    model, rows, frames: int, latent_frames: int, latent_h: int, latent_w: int, patch
+):
+    """Decode normalized transformer rows with the opt-in tiny H3 preview decoder."""
+    latents = unpatchify_video_tokens(
+        rows, latent_frames, latent_h, latent_w, model.latent_channels, patch
+    )
+    decoded = np.array(model.decode(latents.astype(mx.float32), frames))
+    decoded = decoded[0].transpose(1, 2, 3, 0)[:frames]
+    return (np.clip(decoded, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+
+
 def decode_audio(model, rows, audio_latents: int, frames: int):
     cfg = model.config
     latents = unpack_audio_tokens(rows, audio_latents)
@@ -255,6 +267,25 @@ def render_window(
     a chain that scripts a line in one window must not encode that line in the others.
     """
     keyframes = [keyframe] if keyframe is not None else None
+    draft_cache = None
+    text_request_key = None
+    automatic_text = None
+    draft_cache_dir = getattr(args, "draft_cache_dir", None)
+    if draft_cache_dir is not None:
+        from minimax_h3_mlx.draft_cache import DraftCache
+
+        draft_cache = DraftCache(draft_cache_dir, getattr(args, "draft_cache_limit", 50))
+        text_request_key = draft_cache.text_request_key(
+            prompt=prompt,
+            seed=seed,
+            width=args.width,
+            height=args.height,
+            first_frame=keyframe,
+            compact_root=args.compact_root,
+            text_config=args.text_config,
+        )
+        if prompt_cache is None:
+            automatic_text = draft_cache.load_text(text_request_key)
 
     if prompt_cache is not None and prompt_cache.exists():
         with record.phase(f"{label}text_cache_load"):
@@ -270,6 +301,12 @@ def render_window(
             embeds = mx.array(cached["embeds"]).astype(mx.bfloat16)
             text_tags = cached["text_tags"].astype(np.int64)
             mx.eval(embeds)
+    elif automatic_text is not None:
+        with record.phase(f"{label}text_draft_cache_load"):
+            cached_embeds, text_tags, cached_digest = automatic_text
+            embeds = mx.array(cached_embeds).astype(mx.bfloat16)
+            mx.eval(embeds)
+            record.data[f"{label}text_cache_hit"] = True
     else:
         with record.phase(f"{label}text_encode_q8"):
             # A keyframe request runs through the vision tower: H3 conditions on the still
@@ -296,7 +333,18 @@ def render_window(
         del encoder
     # A digest of the actual conditioning tensor, so "each window encoded its own prompt" is
     # something a metrics file proves rather than something the runner claims.
-    digest = hashlib.sha256(np.array(embeds.astype(mx.float32)).tobytes()).hexdigest()[:16]
+    embeds_host = np.array(embeds.astype(mx.float32))
+    full_digest = hashlib.sha256(embeds_host.tobytes()).hexdigest()
+    digest = full_digest[:16]
+    if automatic_text is not None and cached_digest != full_digest:
+        raise ValueError(
+            f"draft text cache returned {cached_digest}, but the loaded embedding hashes to "
+            f"{full_digest}"
+        )
+    if draft_cache is not None and automatic_text is None and prompt_cache is None:
+        with record.phase(f"{label}text_draft_cache_store"):
+            draft_cache.store_text(text_request_key, embeds_host, text_tags, full_digest)
+            record.data[f"{label}text_cache_hit"] = False
     record.data[f"{label}prompt"] = prompt
     record.data[f"{label}prompt_tokens"] = int(len(text_tags))
     record.data[f"{label}text_embed_sha256"] = digest
@@ -329,6 +377,8 @@ def render_window(
         del keyframe_vae
         release()
 
+    lora_path = None
+    lora_scale = None
     with record.phase(f"{label}dit_load_bf16"):
         dit = load_dit(args.dit, verbose=True)
         patch = dit.config.patch_size
@@ -362,34 +412,89 @@ def render_window(
         timestep_table, plan = row_timestep_plan(
             layout, video_sched.timesteps, audio_sched.timesteps
         )
-        cache = ModulationCache.build(dit, timestep_table, dtype=mx.bfloat16)
-        mx.eval(cache.tables)
-        if getattr(args, "lora", None) and getattr(args, "lora_adaln", None):
-            from minimax_h3_mlx import lora as lora_mod
-
-            lora_path, lora_scale = lora_mod.parse_spec(args.lora)
-            record.data[f"{label}lora_adaln"] = lora_mod.absorb_adaln_lora(
-                dit, cache, lora_path, args.lora_adaln, lora_scale, verbose=True
+        adaln_key = None
+        cached_adaln = None
+        if draft_cache is not None:
+            adaln_key = draft_cache.adaln_key(
+                timestep_table=np.array(timestep_table),
+                dit=args.dit,
+                lora=(lora_path, lora_scale) if lora_path is not None else None,
+                lora_adaln=args.lora_adaln,
             )
-            record.flush()
+            cached_adaln = draft_cache.load_adaln(adaln_key, dit)
+        if cached_adaln is not None:
+            cache, adaln_report = cached_adaln
+            record.data[f"{label}adaln_cache_hit"] = True
+            if adaln_report is not None:
+                record.data[f"{label}lora_adaln"] = adaln_report
+        else:
+            cache = ModulationCache.build(dit, timestep_table, dtype=mx.bfloat16)
+            mx.eval(cache.tables)
+            adaln_report = None
+            if getattr(args, "lora", None) and getattr(args, "lora_adaln", None):
+                from minimax_h3_mlx import lora as lora_mod
+
+                adaln_report = lora_mod.absorb_adaln_lora(
+                    dit, cache, lora_path, args.lora_adaln, lora_scale, verbose=True
+                )
+                record.data[f"{label}lora_adaln"] = adaln_report
+                record.flush()
+            if draft_cache is not None:
+                draft_cache.store_adaln(adaln_key, cache, dit, adaln_report)
+                record.data[f"{label}adaln_cache_hit"] = False
         freed = drop_adaln_weights(dit)
         mx.clear_cache()
         print(f"AdaLN cache {cache.nbytes()/1024**2:.1f} MiB; dropped {gb(freed):.2f} GiB")
         # Draw order matches the reference pipeline: conditioning noise first, then video,
         # then audio, so a seed reproduces the same run with and without the staged loader.
-        mx.random.seed(seed)
+        video_noise_shape = (1, dit.config.latents_dim, latent_frames, latent_h, latent_w)
+        audio_noise_shape = (audio_latents * AUDIO_CHANNELS, dit.config.audio_latents_dim)
+        noise_key = None
+        cached_noise = None
+        if draft_cache is not None:
+            noise_key = draft_cache.noise_key(
+                adaln_key=adaln_key,
+                seed=seed,
+                condition_shape=condition_rows.shape if condition_rows is not None else None,
+                video_shape=video_noise_shape,
+                audio_shape=audio_noise_shape,
+            )
+            cached_noise = draft_cache.load_noise(noise_key)
+        if cached_noise is not None:
+            condition_noise = (
+                mx.array(cached_noise["condition"])
+                if cached_noise["condition"] is not None
+                else None
+            )
+            latents = mx.array(cached_noise["video"])
+            audio_rows = mx.array(cached_noise["audio"])
+            record.data[f"{label}noise_cache_hit"] = True
+        else:
+            mx.random.seed(seed)
+            condition_noise = (
+                mx.random.normal(condition_rows.shape).astype(mx.float32)
+                if condition_rows is not None
+                else None
+            )
+            latents = mx.random.normal(video_noise_shape).astype(mx.float32)
+            audio_rows = mx.random.normal(audio_noise_shape).astype(mx.float32)
+            if condition_noise is not None:
+                mx.eval(condition_noise, latents, audio_rows)
+            else:
+                mx.eval(latents, audio_rows)
+            if draft_cache is not None:
+                draft_cache.store_noise(
+                    noise_key,
+                    video=np.array(latents),
+                    audio=np.array(audio_rows),
+                    condition=np.array(condition_noise) if condition_noise is not None else None,
+                )
+                record.data[f"{label}noise_cache_hit"] = False
         if condition_rows is not None:
-            condition_noise = mx.random.normal(condition_rows.shape).astype(mx.float32)
             condition_rows = MiniMaxH3Scheduler(
                 shift=config.sigma_shift_video
             ).scale_noise(condition_rows, KEYFRAME_NOISE_AUG, condition_noise)
-        latents = mx.random.normal(
-            (1, dit.config.latents_dim, latent_frames, latent_h, latent_w)
-        ).astype(mx.float32)
         video_rows = patchify_video_latents(latents, patch)
-        audio_rows = mx.random.normal(
-            (audio_latents * AUDIO_CHANNELS, dit.config.audio_latents_dim)
-        ).astype(mx.float32)
         if condition_rows is not None:
             video_rows = mx.concatenate([condition_rows, video_rows])
         mx.eval(video_rows, audio_rows)
@@ -530,12 +635,24 @@ def render_window(
     del dit, cache, plan, timestep_table, video_sched, audio_sched
     release()
 
-    with record.phase(f"{label}video_vae_decode"):
-        video_vae = load_compact_video_vae(args.compact_root / "video_vae.safetensors")
-        video = decode_video(
-            video_vae, video_rows[n_cond_v:], frames, latent_frames, latent_h, latent_w, patch
-        )
-    del video_vae, video_rows
+    if getattr(args, "draft_decode", "full") == "tae":
+        with record.phase(f"{label}video_tae_decode"):
+            from minimax_h3_mlx.tiny_video_vae import load_tiny_h3_video_decoder
+
+            video_tae = load_tiny_h3_video_decoder(args.tae_checkpoint)
+            video = decode_video_tae(
+                video_tae, video_rows[n_cond_v:], frames, latent_frames, latent_h, latent_w, patch
+            )
+        del video_tae, video_rows
+    else:
+        # This is the dense/HQ path. Keep it isolated from preview changes: release validation
+        # hashes this exact decoder's video stream against a pre-branch render.
+        with record.phase(f"{label}video_vae_decode"):
+            video_vae = load_compact_video_vae(args.compact_root / "video_vae.safetensors")
+            video = decode_video(
+                video_vae, video_rows[n_cond_v:], frames, latent_frames, latent_h, latent_w, patch
+            )
+        del video_vae, video_rows
     release()
 
     with record.phase(f"{label}audio_vae_decode"):
@@ -564,6 +681,32 @@ def main() -> int:
     parser.add_argument("--compact-root", type=Path, required=True)
     parser.add_argument("--text-config", type=Path, required=True)
     parser.add_argument("--prompt-cache", type=Path, default=None)
+    parser.add_argument(
+        "--draft-decode",
+        choices=("full", "tae"),
+        default="full",
+        help="Video decoder for this render. 'full' is the untouched dense/HQ ViT VAE; 'tae' is "
+        "the soft but fast preview decoder and requires --tae-checkpoint.",
+    )
+    parser.add_argument(
+        "--tae-checkpoint",
+        type=Path,
+        default=None,
+        help="madebyollin taeh3.safetensors, used only when --draft-decode tae is explicit.",
+    )
+    parser.add_argument(
+        "--draft-cache-dir",
+        type=Path,
+        default=None,
+        help="Opt-in bounded cache for TAE re-drafts. Reuses text embeddings by content SHA, "
+        "AdaLN tables by sigma schedule, and seeded noise by geometry.",
+    )
+    parser.add_argument(
+        "--draft-cache-limit",
+        type=int,
+        default=50,
+        help="Maximum LRU entries per draft cache class (default: 50).",
+    )
     parser.add_argument(
         "--first-frame",
         type=Path,
@@ -661,6 +804,15 @@ def main() -> int:
         "temporal density for packed rows; audio is stretched to match.",
     )
     parser.add_argument(
+        "--draft-fps",
+        type=int,
+        choices=(12,),
+        default=None,
+        help="Opt-in 12 fps draft delivery. Pass the next-lower 17n+5 frame grid yourself; each "
+        "generated frame is duplicated into a 24 fps mux and the output is labeled _12fps. "
+        "Default is off.",
+    )
+    parser.add_argument(
         "--chain-windows",
         type=int,
         default=1,
@@ -707,6 +859,20 @@ def main() -> int:
         parser.error("--height and --width must be multiples of 32")
     if args.steps < 2:
         parser.error("--steps must be at least 2")
+    if args.draft_decode == "tae" and args.tae_checkpoint is None:
+        parser.error("--draft-decode tae requires --tae-checkpoint")
+    if args.draft_decode == "tae" and not args.tae_checkpoint.is_file():
+        parser.error(f"--tae-checkpoint does not exist: {args.tae_checkpoint}")
+    if args.draft_cache_dir is not None and args.draft_decode != "tae":
+        parser.error("--draft-cache-dir is draft-only; pass --draft-decode tae")
+    if args.draft_cache_limit < 1:
+        parser.error("--draft-cache-limit must be at least 1")
+    if args.draft_fps is not None and args.draft_decode != "tae":
+        parser.error("--draft-fps is draft-only; pass --draft-decode tae")
+    if args.draft_fps is not None and args.playback_fps is not None:
+        parser.error("pass either --draft-fps or --playback-fps, not both")
+    if args.draft_fps is not None and args.chain_windows > 1:
+        parser.error("--draft-fps and --chain-windows do not compose")
     if args.chain_windows < 1:
         parser.error("--chain-windows must be at least 1")
     if args.chain_windows > 1 and args.playback_fps is not None:
@@ -717,6 +883,10 @@ def main() -> int:
             "the last. Cache a single-window render."
         )
     frames = align_num_frames(args.frames)
+    if args.draft_fps is not None and not args.output.stem.endswith(f"_{args.draft_fps}fps"):
+        args.output = args.output.with_name(
+            f"{args.output.stem}_{args.draft_fps}fps{args.output.suffix}"
+        )
     chain = args.chain_windows
     chain_frames = frames + (chain - 1) * (frames - 1)
     if args.chain_total_frames is not None and not 1 <= args.chain_total_frames <= chain_frames:
@@ -752,6 +922,10 @@ def main() -> int:
         "dit": str(args.dit),
         "compact_root": str(args.compact_root),
         "prompt_cache": str(args.prompt_cache) if args.prompt_cache else None,
+        "draft_decode": args.draft_decode,
+        "tae_checkpoint": str(args.tae_checkpoint) if args.tae_checkpoint else None,
+        "draft_cache_dir": str(args.draft_cache_dir) if args.draft_cache_dir else None,
+        "draft_cache_limit": args.draft_cache_limit if args.draft_cache_dir else None,
         "save_stage_a": str(args.save_stage_a) if args.save_stage_a else None,
         "frames": frames,
         "height": args.height,
@@ -761,7 +935,9 @@ def main() -> int:
         "seed": args.seed,
         "step_cache_threshold": args.step_cache,
         "step_cache_max_skip": args.step_cache_max_skip,
-        "playback_fps": args.playback_fps or FPS,
+        "playback_fps": args.draft_fps or args.playback_fps or FPS,
+        "draft_fps": args.draft_fps,
+        "mux_fps": FPS if args.draft_fps is not None else (args.playback_fps or FPS),
         "chain_windows": chain,
         "chain_frames": chain_frames,
         "chain_delivered_frames": delivered_frames,
@@ -857,6 +1033,7 @@ def main() -> int:
         with record.phase("encode_mux" if chain == 1 else "stitch_and_mux"):
             args.output.parent.mkdir(parents=True, exist_ok=True)
             playback = float(args.playback_fps or FPS)
+            audio_tempo = playback / FPS
             if chain > 1:
                 video, audio, seams = stitch_windows(
                     segments, sample_rate, max(0.0, args.chain_audio_crossfade)
@@ -871,6 +1048,19 @@ def main() -> int:
                 )
             else:
                 video, audio = segments[0]
+            if args.draft_fps is not None:
+                # Store a widely compatible 24 fps stream while preserving 12 unique frames per
+                # second. The audio model generated one second for every 24 source frames, so it
+                # is stretched by exactly 2x to cover the duplicated video without pitch shift.
+                # ffmpeg's atempo filter has a short output tail; pad 100 ms before stretching so
+                # `-shortest` cuts against the video boundary instead of silently dropping the
+                # final duplicated frame pair (observed: 112 requested frames became 110).
+                video = np.repeat(video, FPS // args.draft_fps, axis=0)
+                draft_audio_pad = round(0.1 * sample_rate)
+                audio = np.pad(audio, ((0, 0), (0, draft_audio_pad)))
+                record.data["draft_audio_pad_samples"] = int(draft_audio_pad)
+                playback = float(FPS)
+                audio_tempo = args.draft_fps / FPS
             save_mp4(
                 args.output,
                 video,
@@ -878,7 +1068,7 @@ def main() -> int:
                 audio,
                 sample_rate,
                 crf=args.crf,
-                audio_tempo=playback / FPS,
+                audio_tempo=audio_tempo,
             )
             if args.frames_dir is not None:
                 from minimax_h3_mlx.media import save_frames
