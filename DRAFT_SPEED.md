@@ -8,19 +8,19 @@ Base commit: `fd6be7bfc291c40fae89e48b009f8c637b971090`
 
 ## Verdict
 
-The opt-in draft stack finishes a 640x384, 4.67-second clip in **63.857 seconds** on the M4 Max:
+The selected 640x384, 5.17-second draft is **127.882 seconds** on the M4 Max: turbo LoRA, four
+sigma points / three forwards, temporal TAE decode, the complete 124-frame motion/audio grid, and
+the warm bounded re-draft cache.
 
-- turbo LoRA, four sigma points / three forwards;
-- temporal TAE decode;
-- warm bounded re-draft cache;
-- 56 generated frames delivered as 112 duplicate-paired frames in a 24 fps mux (12 unique fps).
+This beats the original 178.919s full-VAE draft by 51.037s (28.5%), but it **misses the 2:00 target
+by 7.882s**. It is nevertheless the selected tier because it preserves the native 124-frame joint
+audio/video trajectory and its cached output is byte-identical to uncached TAE. No reduced-grid
+result passed the combined picture, motion and sound gate.
 
-This clears the 2:00 requirement and the 1:30 stretch target. At the original 124-frame grid, TAE
-alone cuts total wall from 178.919s to 142.196s; the warm re-draft cache cuts that to 134.157s. The
-full frame grid therefore still misses 2:00 because its three DiT forwards alone take ~117.7s.
-
-Every optimization is gated. `--draft-decode` defaults to `full`; `--draft-cache-dir` and
-`--draft-fps` are rejected unless `--draft-decode tae` is explicit. The 12 fps path defaults off.
+Every kept optimization is gated. `--draft-decode` defaults to `full`; `--draft-cache-dir` is
+rejected unless `--draft-decode tae` is explicit. Reduced-grid research remains behind explicit
+`--draft-fps` / `--draft-clock` flags and is not a recommended or default tier. The full frame
+grid's three DiT forwards alone take ~117.7s.
 
 ## Reproduction
 
@@ -32,20 +32,16 @@ Weights used:
 - temporal TAE: `models/tae/taeh3.safetensors` (madebyollin's H3-specific replacement linked from
   the Kijai/MiniMax-H3-TAE model card)
 
-The winning draft-specific arguments are:
+The selected draft-specific arguments are:
 
 ```text
---width 640 --height 384 --frames 56 --steps 4
+--width 640 --height 384 --frames 124 --steps 4
 --draft-decode tae --tae-checkpoint models/tae/taeh3.safetensors
---draft-cache-dir /path/to/draft-cache --draft-fps 12
+--draft-cache-dir /path/to/draft-cache
 ```
 
-`--draft-fps 12` deliberately does not guess a frame grid. The caller requests the next-lower
-`17n+5` point (56 for this approximately five-second clip). The runner duplicates every decoded
-frame and writes a normal 24 fps H.264 stream whose filename is automatically suffixed `_12fps`.
-Audio is pitch-preserving 2x `atempo` stretch. A 100 ms source-audio tail pad prevents ffmpeg's
-filter latency plus `-shortest` from dropping the last duplicate pair; the validated file contains
-exactly 112 frames and lasts 4.666667s.
+The runner generates and decodes all 124 H3 frames and native full-duration audio. No cadence or
+audio-timing transform is part of the recommended path.
 
 ## Cheap latent compatibility gate
 
@@ -91,11 +87,13 @@ sigma points. `text_embed_sha256` is `3f63097e2c9f8c8c` throughout.
 | 124f TAE, no cache | 7.097 | 1.368 | 7.209 | 4.430 | 117.464 | 1.099 | 0.881 | 2.241 | **142.196** |
 | 124f TAE, cache cold | 7.279 | 1.370 | 7.444 | 4.154 | 117.699 | 0.715 | 0.869 | 2.180 | **142.083** |
 | 124f TAE, cache warm | 0.006 | 1.344 | 7.427 | 3.643 | 117.683 | 0.702 | 0.868 | 2.199 | **134.157** |
-| 56f TAE, warm, 12 unique fps | 0.006 | 1.347 | 6.980 | 3.625 | 48.932 | 0.343 | 0.452 | 1.939 | **63.857** |
+| 124f TAE, all caches warm | 0.005 | 0.000 | 6.952 | 2.812 | 115.899 | 0.666 | 0.860 | 0.476 | **127.882** |
+| 56f TAE, old shortened/time-stretched mux (rejected) | 0.006 | 1.347 | 6.980 | 3.625 | 48.932 | 0.343 | 0.452 | 1.939 | **63.857** |
+| 56 unique / 124 delivered, native full audio (rejected) | 0.005 | 0.691 | 7.753 | 4.354 | 50.429 | 0.331 | 0.840 | 2.000 | **66.662** |
 
-Seconds are the runner's own per-phase metrics. The final row delivers 112 muxed frames / 4.667s.
-Its three denoise forwards average 16.31s, versus 39.23s at 124 frames. Packed rows fall from
-9,819 to 4,791.
+Seconds are the runner's own per-phase metrics. The final two rows are falsification evidence, not
+candidates. The selected 124-frame warm TAE run carries the complete native model grid over a
+5.167s container with 9,819 packed rows.
 
 ### Work item 1: TAE draft decode
 
@@ -113,15 +111,17 @@ Full-size A/B artifacts:
 
 ### Work item 2: bounded re-draft caching
 
-The cache has three independent LRU namespaces, each bounded to 50 entries by default:
+The cache has four independent LRU namespaces, each bounded to 50 entries by default:
 
 1. Text requests map `(prompt, seed, canvas, prepared first-frame pixels, encoder identity)` to the
    full embedding SHA-256. Payloads are named by that embedding SHA. A hit is found before the
    encoder is constructed, so the 26 GB Q8 encoder never loads.
-2. AdaLN tables are keyed by the exact timestep-table bytes plus DiT/LoRA/adaLN checkpoint
+2. First-frame VAE rows are keyed by the prepared pixels, canvas, VAE checkpoint and patch size.
+   The encode uses fixed seed 42, so cached float32 rows round-trip exactly.
+3. AdaLN tables are keyed by the exact timestep-table bytes plus DiT/LoRA/adaLN checkpoint
    fingerprints and LoRA scale. The optional final-layer LoRA delta is cached with the 50 block
    tables.
-3. Seeded conditioning/video/audio noise is keyed by schedule, seed and exact tensor shapes.
+4. Seeded conditioning/video/audio noise is keyed by schedule, seed and exact tensor shapes.
 
 Warm text load is 0.006s versus 7.277s cold. AdaLN+noise is 3.643s versus 4.154s cold: reuse works,
 but the expected 2.7s saving was refuted on this pruned DiT. Its cached table is 46.1 MiB in bf16
@@ -135,25 +135,58 @@ e86ef488931e9d13c093fb59ab934990567898138a6b9c5ad10af2004426238d
 
 This proves both cached conditioning and cached noise reproduce the uncached draft bytes.
 
-### Work item 3: 12 fps draft
+The later keyframe-row cache removes the measured 1.344s keyframe phase. With every namespace warm,
+the selected tier measured 127.882s. Its video-stream hash remains the same `e86ef4...` digest as
+the uncached and earlier warm TAE runs, so the speedup does not move the selected picture.
 
-The 56-frame grid, duplicate-paired at mux, cuts denoise **117.683s -> 48.932s** and TAE decode
-**0.702s -> 0.343s**. The delivered strip preserves the man's identity, prop motion, head movement
-and mouth poses. Motion is visibly less fluid but useful for composition/timing iteration. The
-ergonomics pass for an explicitly labeled preview; the option remains off by default.
+### Work item 3: reduced-cadence draft — experimental, not selected
 
-Final artifact and metrics:
+The first 56-frame probe duplicated frames and used a 2x `atempo` stretch. It measured 63.857s,
+but delivered only 112 frames / 4.667s and audibly distorted the generated voice. It was invalid.
 
-- `opt_out/draft_speed/final_12fps.mp4`
-- `opt_out/draft_speed/frames_final_12fps/`
-- `opt_metrics/draft_speed/final_12fps.json`
-- video stream SHA-256: `036c5cb69ef3a4f4b5afa14e914fd1aa5a9ec637a5c0be5440b702ab0cfae4a6`
+A corrected probe kept a 124-frame / 5.167-second delivery and native full-duration audio. Its 56
+video frames were spread across the full model clock (2.307693x temporal scale) and distributed
+over a 24 fps mux. It measured 66.662s, but visual review found the motion/image quality materially
+degraded. That is the intended falsification gate: timing correctness alone is not acceptable.
+
+Later probes kept audio/video row counts equal, used Apple's maximum-overlap time/pitch unit, and
+tested progressively denser temporal grids. None replaced the full-motion TAE tier:
+
+| Probe | Internal source | Delivery | Warm wall | Review |
+|---|---|---|---:|---|
+| native 56 | 640x384, 56f | 640x384, 124f / 5.17s | 50.999s | synchronized slow motion; rejected |
+| joint-spread 56 | 640x384, 56f | 640x384, 120f / 5.0s | 50.993s | timing/image/sound not acceptable; rejected |
+| joint-spread 73 | 576x352, 73f | 640x384, 120f / 5.0s | 54.782s | better cadence; not selected |
+| joint-spread 90 | 512x320, 90f | 640x384, 120f / 5.0s | 53.749s | ongoing R&D; not selected |
+
+The research flags remain explicit and default-off so these arms can keep improving without
+changing the selected 124-frame tier or the dense/HQ path. Inspectable artifacts include:
+
+- invalid short/audio-stretched probe: `opt_out/draft_speed/final_12fps.mp4`
+- corrected-duration but visually degraded probe: `opt_out/draft_speed/corrected_12fps.mp4`
+- 73-frame probe: `opt_out/draft_speed/resident_t73_warm.mp4`
+- 90-frame probe: `opt_out/draft_speed/resident_t90_warm.mp4`
+- metrics: `opt_metrics/draft_speed/final_12fps.json`,
+  `opt_metrics/draft_speed/corrected_12fps.json`,
+  `opt_metrics/draft_speed/resident_t73_warm.json`,
+  `opt_metrics/draft_speed/resident_t90_warm.json`
+
+## Visual decision set
+
+| Choice | Wall | Duration / motion | Artifact | Decision |
+|---|---:|---|---|---|
+| Full VAE reference | 178.919s | 5.17s / native 24 fps | `opt_out/turbo/T3-preview.mp4` | detail reference |
+| **TAE + all caches warm** | **127.882s** | **5.17s / native 24 fps** | `opt_out/draft_speed/tae124_keyframe_warm.mp4` | **selected** |
+| 73-frame experiment | 54.782s | 5.0s / 14.6 unique fps | `opt_out/draft_speed/resident_t73_warm.mp4` | not selected |
+| 90-frame experiment | 53.749s | 5.0s / 18 unique fps | `opt_out/draft_speed/resident_t90_warm.mp4` | ongoing R&D |
+
+The full-VAE/TAE side-by-side strip is `opt_out/draft_speed/full_vs_tae_strip.png`.
 
 ## Full-VAE fallback investigation
 
 Not pursued. TAE passed the cheap compatibility/quality gate and removed 35.7s from the real draft
 decode, so internal profiling and changes to the full VAE would add risk without improving the
-winning draft path. Existing `H3_VAE_BATCH=8` already batches a full 640x384 clip's spatial tiles.
+selected draft path. Existing `H3_VAE_BATCH=8` already batches a full 640x384 clip's spatial tiles.
 
 ## Dense/HQ byte regression
 
@@ -183,10 +216,16 @@ Control artifacts:
 
 ## Tests
 
-- `tests/test_draft_speed.py`: H3 7-token -> 22-frame cadence, RGB clamp, text LRU/content
-  addressing, and exact noise round-trip — passed.
+- `tests/test_draft_speed.py`: H3 cadence/RGB, bounded text and keyframe caches, exact noise,
+  reduced-grid selection, joint-clock row invariance and delivery resize — passed.
 - `tests/test_dit_smoke.py` — passed.
 - `tests/test_video_vae_smoke.py` — passed, including batched-vs-loop exactness.
 - `tests/test_chain_stitch.py` — passed.
 - `tests/test_serve_engine.py` — passed; the defaulted draft attributes preserve resident-engine
   callers that construct their own argument namespace.
+
+The repository aggregate `scripts/run_tests.sh` could not run the PyTorch parity modules in this
+worktree because its `.venv` lacks `torch`, and its first three commands use system `python3`
+without MLX. The five relevant suites above were rerun explicitly with the same MLX interpreter
+used by every benchmark and passed. The aggregate failure was missing dependencies, not a failed
+assertion.

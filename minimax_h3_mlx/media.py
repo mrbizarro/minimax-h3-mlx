@@ -41,6 +41,8 @@ def save_mp4(
     sample_rate: int = 32000,
     crf: int = 18,
     audio_tempo: float = 1.0,
+    audio_stretch_script: str | Path | None = None,
+    audio_output_frames: int | None = None,
 ) -> Path:
     """Encode ``(frames, height, width, 3)`` uint8 video, muxing audio when given.
 
@@ -62,7 +64,29 @@ def save_mp4(
     audio_path = None
     if audio is not None:
         audio_path = path.with_suffix(".wav")
-        save_wav(audio_path, audio, sample_rate)
+        if audio_stretch_script is not None and abs(audio_tempo - 1.0) > 1e-6:
+            if audio_output_frames is None:
+                raise ValueError("audio_output_frames is required for Apple time stretching")
+            source_path = path.with_name(f"{path.stem}_source.wav")
+            save_wav(source_path, audio, sample_rate)
+            audio_path.unlink(missing_ok=True)
+            result = subprocess.run(
+                [
+                    "/usr/bin/swift",
+                    str(audio_stretch_script),
+                    str(source_path),
+                    str(audio_path),
+                    str(audio_tempo),
+                    str(audio_output_frames),
+                ],
+                capture_output=True,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Apple audio time stretch failed: {result.stderr.decode()[:500]}"
+                )
+        else:
+            save_wav(audio_path, audio, sample_rate)
 
     cmd = [
         ffmpeg, "-y", "-loglevel", "error",
@@ -71,7 +95,7 @@ def save_mp4(
     ]
     if audio_path is not None:
         cmd += ["-i", str(audio_path)]
-        if abs(audio_tempo - 1.0) > 1e-6:
+        if audio_stretch_script is None and abs(audio_tempo - 1.0) > 1e-6:
             # atempo is only defined on [0.5, 100]; chain factors for anything slower.
             factors, remaining = [], float(audio_tempo)
             while remaining < 0.5:

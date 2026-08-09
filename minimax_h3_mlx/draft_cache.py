@@ -52,7 +52,7 @@ class DraftCache:
     def __init__(self, root: str | Path, limit: int = 50):
         self.root = Path(root)
         self.limit = max(1, int(limit))
-        for name in ("text", "text_requests", "adaln", "noise"):
+        for name in ("text", "text_requests", "keyframe", "adaln", "noise"):
             (self.root / name).mkdir(parents=True, exist_ok=True)
 
     @staticmethod
@@ -101,6 +101,38 @@ class DraftCache:
                 "audio_shape": list(audio_shape),
             },
         )
+
+    @staticmethod
+    def keyframe_key(*, first_frame, width: int, height: int, compact_root, patch_size) -> str:
+        return _json_key(
+            "keyframe",
+            {
+                "first_frame_sha256": image_digest(first_frame),
+                "width": int(width),
+                "height": int(height),
+                "video_vae": path_fingerprint(Path(compact_root) / "video_vae.safetensors"),
+                "patch_size": list(patch_size),
+            },
+        )
+
+    def load_keyframe(self, key: str):
+        path = self.root / "keyframe" / f"{key}.npz"
+        if not path.is_file():
+            return None
+        try:
+            data = np.load(path, allow_pickle=False)
+            rows = np.asarray(data["rows"], dtype=np.float32)
+            os.utime(path, None)
+            return rows
+        except (OSError, KeyError, ValueError):
+            path.unlink(missing_ok=True)
+            return None
+
+    def store_keyframe(self, key: str, rows) -> None:
+        self._atomic_npz(
+            self.root / "keyframe" / f"{key}.npz", rows=np.asarray(rows, dtype=np.float32)
+        )
+        self._prune(self.root / "keyframe", "*.npz")
 
     def load_text(self, request_key: str):
         request_path = self.root / "text_requests" / f"{request_key}.json"

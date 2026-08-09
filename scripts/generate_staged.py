@@ -156,6 +156,45 @@ def decode_audio(model, rows, audio_latents: int, frames: int):
     return waveform[:, :samples].astype(np.float32)
 
 
+def draft_video_grid(delivery_frames: int, draft_fps: int) -> int:
+    """Choose the next-lower H3 grid without changing its joint audio/video tensor shape."""
+    target_unique = delivery_frames * draft_fps // FPS
+    return max(22, (target_unique - 5) // 17 * 17 + 5)
+
+
+def distribute_draft_frames(video: np.ndarray, delivery_frames: int) -> np.ndarray:
+    """Repeat native source frames across an exact-length 24 fps delivery timeline."""
+    indices = np.rint(np.linspace(0, len(video) - 1, delivery_frames)).astype(np.int64)
+    return video[indices]
+
+
+def resize_draft_video(video: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Resize unique preview frames before temporal duplication."""
+    from PIL import Image
+
+    return np.stack(
+        [
+            np.asarray(Image.fromarray(frame).resize((width, height), Image.Resampling.LANCZOS))
+            for frame in video
+        ]
+    )
+
+
+def spread_joint_draft_clock(layout, text_rows: int, scale: float) -> None:
+    """Spread target audio and video positions together without adding packed rows."""
+    positions = np.asarray(layout.position_ids, dtype=np.float32)
+    target_video = np.asarray(layout.video_indices.tolist(), dtype=np.int64)[
+        layout.num_condition_video_rows :
+    ]
+    target_audio = np.asarray(layout.audio_indices.tolist(), dtype=np.int64)[
+        layout.num_condition_audio_rows :
+    ]
+    targets = np.concatenate([target_audio, target_video])
+    origin = float(text_rows)
+    positions[targets, 0] = origin + (positions[targets, 0] - origin) * scale
+    layout.position_ids = mx.array(positions)
+
+
 CHAIN_PROMPT_SEPARATOR = " ||| "
 
 
@@ -367,14 +406,37 @@ def render_window(
     anchors: tuple[str, ...] = ()
     if keyframes is not None:
         anchors = ("first",)
-        with record.phase(f"{label}keyframe_encode"):
-            keyframe_vae = load_compact_video_vae(args.compact_root / "video_vae.safetensors")
-            condition_rows = encode_keyframe_rows(
-                keyframe_vae, keyframes, args.height, args.width, patch
+        keyframe_key = None
+        cached_keyframe = None
+        if draft_cache is not None:
+            keyframe_key = draft_cache.keyframe_key(
+                first_frame=keyframe,
+                width=args.width,
+                height=args.height,
+                compact_root=args.compact_root,
+                patch_size=patch,
             )
-            mx.eval(condition_rows)
-            print(f"keyframe conditioning rows: {condition_rows.shape}")
-        del keyframe_vae
+            cached_keyframe = draft_cache.load_keyframe(keyframe_key)
+        if cached_keyframe is not None:
+            with record.phase(f"{label}keyframe_draft_cache_load"):
+                condition_rows = mx.array(cached_keyframe)
+                mx.eval(condition_rows)
+                record.data[f"{label}keyframe_cache_hit"] = True
+        else:
+            with record.phase(f"{label}keyframe_encode"):
+                keyframe_vae = load_compact_video_vae(args.compact_root / "video_vae.safetensors")
+                condition_rows = encode_keyframe_rows(
+                    keyframe_vae, keyframes, args.height, args.width, patch
+                )
+                mx.eval(condition_rows)
+                print(f"keyframe conditioning rows: {condition_rows.shape}")
+            del keyframe_vae
+            if draft_cache is not None:
+                with record.phase(f"{label}keyframe_draft_cache_store"):
+                    draft_cache.store_keyframe(
+                        keyframe_key, np.array(condition_rows.astype(mx.float32))
+                    )
+                    record.data[f"{label}keyframe_cache_hit"] = False
         release()
 
     lora_path = None
@@ -388,15 +450,29 @@ def render_window(
 
             lora_mod.AUDIT = bool(getattr(args, "lora_audit", False))
             lora_path, lora_scale = lora_mod.parse_spec(lora_spec)
-            lora_report = lora_mod.apply_lora(
-                dit, lora_path, lora_scale, mode=getattr(args, "lora_mode", "runtime"), verbose=True
-            )
-            record.data[f"{label}lora"] = lora_report.summary()
+            if not getattr(args, "lora_already_applied", False):
+                lora_report = lora_mod.apply_lora(
+                    dit,
+                    lora_path,
+                    lora_scale,
+                    mode=getattr(args, "lora_mode", "runtime"),
+                    verbose=True,
+                )
+                record.data[f"{label}lora"] = lora_report.summary()
+            else:
+                record.data[f"{label}lora"] = {
+                    "path": str(lora_path),
+                    "scale": float(lora_scale),
+                    "mode": "resident-preapplied",
+                }
             record.flush()
 
     layout = build_packed_sequence(
         text_tags, latent_frames, latent_h, latent_w, audio_latents, patch, anchors
     )
+    if getattr(args, "draft_clock", "native") == "spread":
+        spread_joint_draft_clock(layout, len(text_tags), args.draft_clock_scale)
+        record.data[f"{label}draft_clock_scale"] = round(float(args.draft_clock_scale), 6)
     print(
         f"geometry: {args.width}x{args.height}, {frames} frames, "
         f"{layout.sequence_length:,} packed rows",
@@ -434,9 +510,17 @@ def render_window(
             if getattr(args, "lora", None) and getattr(args, "lora_adaln", None):
                 from minimax_h3_mlx import lora as lora_mod
 
-                adaln_report = lora_mod.absorb_adaln_lora(
-                    dit, cache, lora_path, args.lora_adaln, lora_scale, verbose=True
+                reused_resident_table = bool(
+                    getattr(ModulationCache, "last_build_reused", False)
                 )
+                if reused_resident_table and hasattr(ModulationCache, "current_lora_report"):
+                    adaln_report = ModulationCache.current_lora_report()
+                else:
+                    adaln_report = lora_mod.absorb_adaln_lora(
+                        dit, cache, lora_path, args.lora_adaln, lora_scale, verbose=True
+                    )
+                    if hasattr(ModulationCache, "remember_lora_report"):
+                        ModulationCache.remember_lora_report(adaln_report)
                 record.data[f"{label}lora_adaln"] = adaln_report
                 record.flush()
             if draft_cache is not None:
@@ -806,12 +890,22 @@ def main() -> int:
     parser.add_argument(
         "--draft-fps",
         type=int,
-        choices=(12,),
+        choices=(12, 15, 18),
         default=None,
-        help="Opt-in 12 fps draft delivery. Pass the next-lower 17n+5 frame grid yourself; each "
-        "generated frame is duplicated into a 24 fps mux and the output is labeled _12fps. "
-        "Default is off.",
+        help="EXPERIMENTAL reduced-cadence TAE preview (not the recommended tier). --frames "
+        "remains the delivery duration; the native "
+        "joint audio/video grid is kept intact, then both streams are slowed by the same factor. "
+        "Audio uses Apple's high-overlap time/pitch unit rather than ffmpeg atempo.",
     )
+    parser.add_argument(
+        "--draft-clock",
+        choices=("native", "spread"),
+        default="native",
+        help="EXPERIMENTAL: with --draft-fps, keep the reduced joint clock native (slow-motion) or "
+        "spread both audio and video positions over the requested timeline. No rows are added.",
+    )
+    parser.add_argument("--draft-output-width", type=int, default=None)
+    parser.add_argument("--draft-output-height", type=int, default=None)
     parser.add_argument(
         "--chain-windows",
         type=int,
@@ -873,6 +967,12 @@ def main() -> int:
         parser.error("pass either --draft-fps or --playback-fps, not both")
     if args.draft_fps is not None and args.chain_windows > 1:
         parser.error("--draft-fps and --chain-windows do not compose")
+    if args.draft_clock != "native" and args.draft_fps is None:
+        parser.error("--draft-clock is only legal with --draft-fps")
+    if (args.draft_output_width is None) != (args.draft_output_height is None):
+        parser.error("pass both --draft-output-width and --draft-output-height")
+    if args.draft_output_width is not None and args.draft_fps is None:
+        parser.error("draft output resizing is only legal with --draft-fps")
     if args.chain_windows < 1:
         parser.error("--chain-windows must be at least 1")
     if args.chain_windows > 1 and args.playback_fps is not None:
@@ -882,7 +982,13 @@ def main() -> int:
             "--save-stage-a holds one window's latents; with a chain every window would overwrite "
             "the last. Cache a single-window render."
         )
-    frames = align_num_frames(args.frames)
+    requested_frames = align_num_frames(args.frames)
+    draft_delivery_frames = int(args.frames) if args.draft_fps is not None else requested_frames
+    frames = (
+        draft_video_grid(draft_delivery_frames, args.draft_fps)
+        if args.draft_fps is not None
+        else requested_frames
+    )
     if args.draft_fps is not None and not args.output.stem.endswith(f"_{args.draft_fps}fps"):
         args.output = args.output.with_name(
             f"{args.output.stem}_{args.draft_fps}fps{args.output.suffix}"
@@ -891,7 +997,12 @@ def main() -> int:
     chain_frames = frames + (chain - 1) * (frames - 1)
     if args.chain_total_frames is not None and not 1 <= args.chain_total_frames <= chain_frames:
         parser.error(f"--chain-total-frames must be in 1..{chain_frames} for this chain")
-    delivered_frames = args.chain_total_frames or chain_frames
+    delivered_frames = (
+        draft_delivery_frames
+        if args.draft_fps is not None
+        else (args.chain_total_frames or chain_frames)
+    )
+    args.draft_clock_scale = delivered_frames / frames if args.draft_fps is not None else 1.0
 
     if args.chain_prompts is not None:
         if args.prompt is not None:
@@ -928,6 +1039,7 @@ def main() -> int:
         "draft_cache_limit": args.draft_cache_limit if args.draft_cache_dir else None,
         "save_stage_a": str(args.save_stage_a) if args.save_stage_a else None,
         "frames": frames,
+        "delivery_frames": delivered_frames,
         "height": args.height,
         "width": args.width,
         "sigma_points": args.steps,
@@ -935,9 +1047,18 @@ def main() -> int:
         "seed": args.seed,
         "step_cache_threshold": args.step_cache,
         "step_cache_max_skip": args.step_cache_max_skip,
-        "playback_fps": args.draft_fps or args.playback_fps or FPS,
+        "playback_fps": args.playback_fps or FPS,
         "draft_fps": args.draft_fps,
-        "mux_fps": FPS if args.draft_fps is not None else (args.playback_fps or FPS),
+        "draft_unique_fps": (
+            round(frames / (delivered_frames / FPS), 3) if args.draft_fps is not None else None
+        ),
+        "draft_clock": args.draft_clock if args.draft_fps is not None else None,
+        "draft_clock_scale": (
+            round(args.draft_clock_scale, 6) if args.draft_fps is not None else None
+        ),
+        "draft_output_width": args.draft_output_width,
+        "draft_output_height": args.draft_output_height,
+        "mux_fps": args.playback_fps or FPS,
         "chain_windows": chain,
         "chain_frames": chain_frames,
         "chain_delivered_frames": delivered_frames,
@@ -1048,19 +1169,27 @@ def main() -> int:
                 )
             else:
                 video, audio = segments[0]
+            audio_stretch_script = None
+            audio_output_frames = None
             if args.draft_fps is not None:
-                # Store a widely compatible 24 fps stream while preserving 12 unique frames per
-                # second. The audio model generated one second for every 24 source frames, so it
-                # is stretched by exactly 2x to cover the duplicated video without pitch shift.
-                # ffmpeg's atempo filter has a short output tail; pad 100 ms before stretching so
-                # `-shortest` cuts against the video boundary instead of silently dropping the
-                # final duplicated frame pair (observed: 112 requested frames became 110).
-                video = np.repeat(video, FPS // args.draft_fps, axis=0)
-                draft_audio_pad = round(0.1 * sample_rate)
-                audio = np.pad(audio, ((0, 0), (0, draft_audio_pad)))
-                record.data["draft_audio_pad_samples"] = int(draft_audio_pad)
+                # Keep the exact joint tensor shape that passed the picture-quality gate. Only
+                # after decoding, distribute its frames over the requested timeline and slow its
+                # own synchronized audio by the identical ratio. AVAudioUnitTimePitch at maximum
+                # overlap avoids the audible smearing seen with ffmpeg's 2x `atempo` stretch.
+                source_frames = len(video)
+                if args.draft_output_width is not None:
+                    video = resize_draft_video(
+                        video, args.draft_output_width, args.draft_output_height
+                    )
+                video = distribute_draft_frames(video, delivered_frames)
                 playback = float(FPS)
-                audio_tempo = args.draft_fps / FPS
+                audio_tempo = source_frames / delivered_frames
+                audio_stretch_script = Path(__file__).with_name("time_stretch_audio.swift")
+                # AAC's frame boundary plus `-shortest` otherwise cuts a video frame when the
+                # exact stretched waveform ends a fraction of a millisecond before the nominal
+                # video boundary. Render 50 ms of the time-pitch unit's silent tail; ffmpeg trims
+                # it against the 124-frame video instead of trimming the video to 123 frames.
+                audio_output_frames = round((delivered_frames / FPS + 0.05) * sample_rate)
             save_mp4(
                 args.output,
                 video,
@@ -1069,6 +1198,8 @@ def main() -> int:
                 sample_rate,
                 crf=args.crf,
                 audio_tempo=audio_tempo,
+                audio_stretch_script=audio_stretch_script,
+                audio_output_frames=audio_output_frames,
             )
             if args.frames_dir is not None:
                 from minimax_h3_mlx.media import save_frames

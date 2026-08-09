@@ -11,9 +11,21 @@ import mlx.core as mx
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from minimax_h3_mlx.draft_cache import DraftCache  # noqa: E402
 from minimax_h3_mlx.tiny_video_vae import TinyH3VideoDecoder  # noqa: E402
+from generate_staged import (  # noqa: E402
+    distribute_draft_frames,
+    draft_video_grid,
+    resize_draft_video,
+    spread_joint_draft_clock,
+)
+from minimax_h3_mlx.packing import (  # noqa: E402
+    audio_latent_num_frames,
+    build_packed_sequence,
+    video_latent_num_frames,
+)
 
 
 FAILURES = []
@@ -26,6 +38,26 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def main() -> int:
+    check("124-frame delivery selects the native 56-frame grid", draft_video_grid(124, 12) == 56)
+    check("exact five-second delivery also selects 56 frames", draft_video_grid(120, 12) == 56)
+    check("15 fps budget selects the native 73-frame grid", draft_video_grid(120, 15) == 73)
+    check("18 fps budget selects the native 90-frame grid", draft_video_grid(120, 18) == 90)
+    source = np.arange(56, dtype=np.uint8).reshape(56, 1, 1, 1)
+    delivered = distribute_draft_frames(source, 124)
+    check("draft mux preserves the requested duration", len(delivered) == 124)
+    check("draft mux retains every source frame", len(np.unique(delivered)) == 56)
+    resized = resize_draft_video(np.zeros((2, 4, 6, 3), dtype=np.uint8), 8, 10)
+    check("draft delivery resize uses requested canvas", resized.shape == (2, 10, 8, 3))
+    layout = build_packed_sequence(
+        [1], video_latent_num_frames(56), 4, 4, audio_latent_num_frames(56), (1, 2, 2)
+    )
+    rows_before = layout.sequence_length
+    times_before = np.asarray(layout.position_ids)[:, 0].copy()
+    spread_joint_draft_clock(layout, 1, 120 / 56)
+    times_after = np.asarray(layout.position_ids)[:, 0]
+    check("joint clock spread adds no packed rows", layout.sequence_length == rows_before)
+    check("joint clock spread advances the media tail", times_after.max() > times_before.max() * 2)
+
     mx.random.seed(0)
     decoder = TinyH3VideoDecoder()
     # Seven H3 tokens are the smallest native grid (22 pixel frames after restoring the three
@@ -67,6 +99,13 @@ def main() -> int:
             noise is not None
             and np.array_equal(noise["video"], embeds)
             and np.array_equal(noise["audio"], tags.astype(np.float32)),
+        )
+
+        keyframe_rows = np.arange(24, dtype=np.float32).reshape(3, 8)
+        cache.store_keyframe("keyframe", keyframe_rows)
+        check(
+            "keyframe rows round-trip exactly",
+            np.array_equal(cache.load_keyframe("keyframe"), keyframe_rows),
         )
 
     print()

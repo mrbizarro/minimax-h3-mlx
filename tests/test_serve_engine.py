@@ -62,8 +62,15 @@ def main() -> int:
     table_b = mx.array([0.0, 0.25, 1.0], dtype=mx.float32)
 
     first = serve._CachingModulationCache.build(dit, table_a)
+    serve._CachingModulationCache.remember_lora_report({"absorbed": True})
     again = serve._CachingModulationCache.build(dit, table_a)
+    check("resident table hit is reported", serve._CachingModulationCache.last_build_reused)
+    check(
+        "resident table keeps one absorbed LoRA report",
+        serve._CachingModulationCache.current_lora_report() == {"absorbed": True},
+    )
     other = serve._CachingModulationCache.build(dit, table_b)
+    check("different timesteps are not marked reused", not serve._CachingModulationCache.last_build_reused)
 
     check("same timesteps reuse one table", first is again)
     check("different timesteps rebuild", other is not first)

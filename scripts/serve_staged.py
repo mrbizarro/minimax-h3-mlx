@@ -151,6 +151,9 @@ class _CachingModulationCache:
     limit = 4
     hits = 0
     misses = 0
+    last_build_reused = False
+    active_key = None
+    lora_reports: "dict[bytes, dict]" = {}
 
     @classmethod
     def build(cls, dit, timesteps, dtype=mx.bfloat16):
@@ -158,17 +161,35 @@ class _CachingModulationCache:
         hit = cls.store.get(key)
         if hit is not None:
             cls.hits += 1
+            cls.last_build_reused = True
+            cls.active_key = key
             return hit
         cls.misses += 1
+        cls.last_build_reused = False
+        cls.active_key = key
         built = _RealModulationCache.build(dit, timesteps, dtype=dtype)
         if len(cls.store) >= cls.limit:
-            cls.store.pop(next(iter(cls.store)))
+            evicted = next(iter(cls.store))
+            cls.store.pop(evicted)
+            cls.lora_reports.pop(evicted, None)
         cls.store[key] = built
         return built
 
     @classmethod
+    def remember_lora_report(cls, report):
+        if cls.active_key is not None:
+            cls.lora_reports[cls.active_key] = report
+
+    @classmethod
+    def current_lora_report(cls):
+        return cls.lora_reports.get(cls.active_key)
+
+    @classmethod
     def clear(cls):
         cls.store.clear()
+        cls.lora_reports.clear()
+        cls.active_key = None
+        cls.last_build_reused = False
 
 
 # ---- the engine --------------------------------------------------------------------------------
@@ -192,6 +213,13 @@ class ResidentEngine:
             return self.dit
         started = time.perf_counter()
         self.dit = _real_load_dit(self.opts.dit, verbose=True)
+        if self.opts.lora:
+            from minimax_h3_mlx import lora as lora_mod
+
+            lora_path, lora_scale = lora_mod.parse_spec(self.opts.lora)
+            self.lora_report = lora_mod.apply_lora(
+                self.dit, lora_path, lora_scale, mode="runtime", verbose=True
+            ).summary()
         elapsed = time.perf_counter() - started
         self.dit_loads += 1
         self.dit_load_seconds += elapsed
@@ -291,12 +319,23 @@ def build_args(engine, params: dict) -> SimpleNamespace:
         step_cache_max_skip=int(params.get("step_cache_max_skip", 2)),
         step_cache_probe=False,
         save_stage_a=None,
+        draft_decode=opts.draft_decode,
+        tae_checkpoint=Path(opts.tae_checkpoint) if opts.tae_checkpoint else None,
+        draft_cache_dir=None,
+        draft_cache_limit=50,
+        draft_fps=int(params["draft_fps"]) if params.get("draft_fps") else None,
+        draft_clock=str(params.get("draft_clock", "native")),
+        lora=opts.lora,
+        lora_mode="runtime",
+        lora_adaln=Path(opts.lora_adaln) if opts.lora_adaln else None,
+        lora_audit=False,
+        lora_already_applied=bool(opts.lora),
     )
 
 
 def run_generate(engine, job_id, params: dict) -> dict:
     opts = engine.opts
-    frames = align_num_frames(int(params.get("frames", 73)))
+    requested_frames = align_num_frames(int(params.get("frames", 73)))
     height, width = int(params["height"]), int(params["width"])
     if height % 32 or width % 32:
         raise ValueError("height and width must be multiples of 32")
@@ -309,6 +348,13 @@ def run_generate(engine, job_id, params: dict) -> dict:
 
     args = build_args(engine, params)
     args.first_frame = Path(first_frame) if first_frame else None
+    delivery_frames = int(params.get("frames", 73)) if args.draft_fps is not None else requested_frames
+    frames = (
+        staged.draft_video_grid(delivery_frames, args.draft_fps)
+        if args.draft_fps is not None
+        else requested_frames
+    )
+    args.draft_clock_scale = delivery_frames / frames if args.draft_fps is not None else 1.0
 
     keyframe = None
     if first_frame:
@@ -334,6 +380,7 @@ def run_generate(engine, job_id, params: dict) -> dict:
         "dit_resident_at_start": engine.dit is not None,
         "resident_vae": bool(opts.resident_vae),
         "frames": frames,
+        "delivery_frames": delivery_frames,
         "height": height,
         "width": width,
         "sigma_points": args.steps,
@@ -342,6 +389,16 @@ def run_generate(engine, job_id, params: dict) -> dict:
         "step_cache_threshold": args.step_cache,
         "step_cache_max_skip": args.step_cache_max_skip,
         "playback_fps": FPS,
+        "draft_fps": args.draft_fps,
+        "draft_unique_fps": (
+            round(frames / (delivery_frames / FPS), 3) if args.draft_fps is not None else None
+        ),
+        "draft_clock": args.draft_clock if args.draft_fps is not None else None,
+        "draft_clock_scale": (
+            round(args.draft_clock_scale, 6) if args.draft_fps is not None else None
+        ),
+        "draft_output_width": params.get("draft_output_width"),
+        "draft_output_height": params.get("draft_output_height"),
         "vae_decode_batch": staged.resolved_decode_batch(),
         "runner_sha256": engine.opts.runner_digest,
         "device": mx.device_info(),
@@ -366,7 +423,32 @@ def run_generate(engine, job_id, params: dict) -> dict:
 
     with record.phase("encode_mux"):
         output.parent.mkdir(parents=True, exist_ok=True)
-        save_mp4(output, video, float(FPS), audio, sample_rate, crf=crf)
+        audio_tempo = 1.0
+        audio_stretch_script = None
+        audio_output_frames = None
+        if args.draft_fps is not None:
+            source_frames = len(video)
+            output_width = params.get("draft_output_width")
+            output_height = params.get("draft_output_height")
+            if (output_width is None) != (output_height is None):
+                raise ValueError("pass both draft_output_width and draft_output_height")
+            if output_width is not None:
+                video = staged.resize_draft_video(video, int(output_width), int(output_height))
+            video = staged.distribute_draft_frames(video, delivery_frames)
+            audio_tempo = source_frames / delivery_frames
+            audio_stretch_script = Path(__file__).with_name("time_stretch_audio.swift")
+            audio_output_frames = round((delivery_frames / FPS + 0.05) * sample_rate)
+        save_mp4(
+            output,
+            video,
+            float(FPS),
+            audio,
+            sample_rate,
+            crf=crf,
+            audio_tempo=audio_tempo,
+            audio_stretch_script=audio_stretch_script,
+            audio_output_frames=audio_output_frames,
+        )
         frames_dir = params.get("frames_dir")
         if frames_dir:
             from minimax_h3_mlx.media import save_frames
@@ -492,6 +574,10 @@ def main() -> int:
     parser.add_argument("--dit", required=True)
     parser.add_argument("--compact-root", required=True)
     parser.add_argument("--text-config", default=None)
+    parser.add_argument("--lora", default=None)
+    parser.add_argument("--lora-adaln", default=None)
+    parser.add_argument("--draft-decode", choices=("full", "tae"), default="full")
+    parser.add_argument("--tae-checkpoint", default=None)
     parser.add_argument(
         "--cond-cache",
         default=None,
@@ -517,6 +603,9 @@ def main() -> int:
     )
     parser.add_argument("--idle-timeout", type=float, default=1800.0)
     opts = parser.parse_args()
+
+    if opts.draft_decode == "tae" and not opts.tae_checkpoint:
+        parser.error("--draft-decode tae requires --tae-checkpoint")
 
     if opts.cond_cache is None:
         opts.cond_cache = str(Path(opts.dit).resolve().parent / "cond_cache")
