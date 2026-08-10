@@ -208,7 +208,18 @@ def plan(model, pairs: dict[str, tuple[mx.array, mx.array]]) -> tuple[dict, list
             continue
         parent, attr = targets[name]
         base = getattr(parent, attr)
-        out_dim, in_dim = base.weight.shape
+        # QuantizedLinear stores PACKED uint32 rows: weight is (out, in*bits/32),
+        # and comparing a LoRA's logical dims against packed storage skipped all
+        # 208 modules on the Q8 DiT — silently, with the render still "working"
+        # (caught 2026-08-10 by the CivitAI validation render: applied=0). The
+        # logical width lives in the quantization metadata: scales is
+        # (out, in/group_size), so in = scales.shape[1] * group_size.
+        out_dim = int(base.weight.shape[0])
+        scales = getattr(base, "scales", None)
+        if scales is not None:
+            in_dim = int(scales.shape[1]) * int(getattr(base, "group_size", 64))
+        else:
+            in_dim = int(base.weight.shape[1])
         if int(a.shape[1]) != in_dim or int(b.shape[0]) != out_dim:
             skipped.append(ModuleReport(
                 name, "skipped",
@@ -246,6 +257,16 @@ def apply_lora(
             report.permuted_qkv += 1
         if mode == "runtime":
             setattr(parent, attr, LoRALinear(base, a, b, scale))
+        elif getattr(base, "scales", None) is not None:
+            # Fusing into a QuantizedLinear would add a bf16 delta to PACKED
+            # uint32 storage — silent weight corruption, not a merge. Runtime
+            # mode is the correct spelling on a quantized DiT (LoRALinear
+            # delegates to the wrapped layer, so packing never matters).
+            skipped.append(ModuleReport(
+                name, "skipped",
+                "fuse mode cannot merge into a quantized layer — use runtime mode",
+                int(a.shape[0]), tuple(b.shape)))
+            continue
         elif scale != 0.0:
             # The merge itself is exact in float32; the loss is the single rounding back to the
             # base dtype, which is the whole point of the `fuse` control arm.
