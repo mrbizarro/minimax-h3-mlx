@@ -24,6 +24,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from minimax_h3_mlx.adaln import ModulationCache, drop_adaln_weights
 from minimax_h3_mlx.config import PipelineConfig
+from minimax_h3_mlx.live_preview import (
+    ABORT_EXIT_CODE,
+    DEFAULT_CONTEXT as LIVE_PREVIEW_DEFAULT_CONTEXT,
+    LivePreviewAborted,
+    LivePreviewMonitor,
+)
 from minimax_h3_mlx.load import load_compact_audio_vae, load_compact_video_vae, load_dit
 from minimax_h3_mlx.media import save_mp4
 from minimax_h3_mlx.packing import (
@@ -317,6 +323,8 @@ def render_window(
     keyframe,
     first_frame_key: str,
     prompt_cache: Path | None,
+    live_preview: LivePreviewMonitor | None = None,
+    window_index: int = 1,
 ):
     """Render one window end to end and hand back decoded pixels, audio and the sample rate.
 
@@ -605,6 +613,15 @@ def render_window(
 
     n_cond_v = layout.num_condition_video_rows
 
+    if live_preview is not None:
+        live_preview.start_window(
+            window=window_index,
+            latent_frames=latent_frames,
+            latent_height=latent_h,
+            latent_width=latent_w,
+            patch=patch,
+        )
+
     num_forwards = len(video_sched.timesteps)
     step_cache = (
         StepResidualCache(args.step_cache, num_forwards, max_skip=args.step_cache_max_skip)
@@ -615,6 +632,10 @@ def render_window(
     step_times = []
     with record.phase(f"{label}joint_denoise"):
         for index, timestep in enumerate(video_sched.timesteps.tolist()):
+            if live_preview is not None:
+                # Checked before the forward is launched, so an abort costs at most the forward
+                # already in flight — never a whole extra one.
+                live_preview.check_abort(f"before forward {index + 1}/{num_forwards}")
             started = time.perf_counter()
             forward_args = (
                 video_rows[None].astype(mx.bfloat16),
@@ -646,6 +667,10 @@ def render_window(
                 if step_cache is not None:
                     step_cache.store(video_rows, audio_rows, video_pred, audio_pred)
 
+            # The rows exactly as this forward saw them. `video_rows` is about to be rebound, and
+            # the live preview's x0 estimate needs x_t and v from the *same* forward.
+            forward_video_rows = video_rows
+
             # Only generated rows are written back; keyframe anchors survive untouched, so no
             # masking is needed. Rebind rather than assign into a slice — the stepped result is
             # a lazy graph over the very rows it would overwrite.
@@ -671,6 +696,25 @@ def render_window(
                 f"(active {gb(mx.get_active_memory()):.1f} GiB)",
                 flush=True,
             )
+            if live_preview is not None:
+                # Deliberately outside the step timer: `step_times` stays comparable to every
+                # render ever measured, and the preview's cost is reported as its own number.
+                preview_seconds = live_preview.after_forward(
+                    video_rows=forward_video_rows,
+                    video_pred=video_pred,
+                    n_cond_v=n_cond_v,
+                    timestep=float(timestep),
+                    forward_seconds=elapsed,
+                )
+                if preview_seconds:
+                    print(
+                        f"  live preview {live_preview.forward}/{live_preview.total_forwards} "
+                        f"-> {live_preview.directory}/preview_"
+                        f"{live_preview.forward:02d}.png ({preview_seconds:.2f}s)",
+                        flush=True,
+                    )
+                live_preview.check_abort(f"after forward {index + 1}/{num_forwards}")
+            del forward_video_rows
             if index == 0 and getattr(args, "lora_audit", False) and getattr(args, "lora", None):
                 from minimax_h3_mlx import lora as lora_mod
 
@@ -797,6 +841,59 @@ def main() -> int:
         type=Path,
         default=None,
         help="madebyollin taeh3.safetensors, used only when --draft-decode tae is explicit.",
+    )
+    parser.add_argument(
+        "--live-preview",
+        choices=("off", "tae"),
+        default="off",
+        help="Publish a TAE thumbnail of the current x0 estimate after every denoising forward, "
+        "so a bad take can be stopped at minute two instead of minute fifty. Reads the sampler "
+        "state and writes only PNG/JSON, so the render itself is untouched. Requires "
+        "--tae-checkpoint; composes with either --draft-decode.",
+    )
+    parser.add_argument(
+        "--live-preview-every",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Decode a preview on every Nth forward (default 1 = every forward). The last forward "
+        "always publishes. Use this if the per-forward decode is a bigger share of a long render "
+        "than you want to pay.",
+    )
+    parser.add_argument(
+        "--live-preview-dir",
+        type=Path,
+        default=None,
+        help="Where the preview PNGs, status.json and the ABORT sentinel live. Defaults to "
+        "'live/' beside --output.",
+    )
+    parser.add_argument(
+        "--live-preview-latent-frame",
+        type=int,
+        default=None,
+        metavar="INDEX",
+        help="Latent frame to preview; default is the middle of the window, which is the frame "
+        "that says most about the take. status.json reports the pixel frame it corresponds to.",
+    )
+    parser.add_argument(
+        "--live-preview-context",
+        type=int,
+        default=None,
+        metavar="TOKENS",
+        help="Latent frames of causal warm-up decoded ahead of the previewed frame. The tiny "
+        "decoder's residual blocks remember the previous frame, so 0 renders the frame as if it "
+        "opened the clip and smears it; 4 (the default) is indistinguishable from the full-sequence "
+        "decode and costs the same as 2. See scripts/probe_preview_context.py.",
+    )
+    parser.add_argument(
+        "--live-preview-downscale",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Average-pool the previewed latent by N before decoding it. 0 (the default) picks the "
+        "smallest power of two that keeps the decode's transient working set near 3 GiB — 1 at "
+        "draft, 2 at 1024x576 and Native, where an unpooled preview would want 6-11 GiB on top of "
+        "a render already peaking near 50. Pass 1 to force a full-resolution thumbnail.",
     )
     parser.add_argument(
         "--draft-cache-dir",
@@ -987,6 +1084,24 @@ def main() -> int:
         parser.error("--draft-decode tae requires --tae-checkpoint")
     if args.draft_decode == "tae" and not args.tae_checkpoint.is_file():
         parser.error(f"--tae-checkpoint does not exist: {args.tae_checkpoint}")
+    if args.live_preview != "off":
+        if args.tae_checkpoint is None:
+            parser.error("--live-preview tae requires --tae-checkpoint")
+        if not args.tae_checkpoint.is_file():
+            parser.error(f"--tae-checkpoint does not exist: {args.tae_checkpoint}")
+        if args.live_preview_every < 1:
+            parser.error("--live-preview-every must be at least 1")
+        if args.live_preview_context is not None and args.live_preview_context < 0:
+            parser.error("--live-preview-context cannot be negative")
+        if args.live_preview_downscale < 0:
+            parser.error("--live-preview-downscale cannot be negative")
+    elif (
+        args.live_preview_dir is not None
+        or args.live_preview_latent_frame is not None
+        or args.live_preview_context is not None
+        or args.live_preview_downscale
+    ):
+        parser.error("the --live-preview-* options need --live-preview tae")
     if args.draft_cache_dir is not None and args.draft_decode != "tae":
         parser.error("--draft-cache-dir is draft-only; pass --draft-decode tae")
     if args.draft_cache_limit < 1:
@@ -1070,6 +1185,16 @@ def main() -> int:
             "a prompt is required: give one positionally, or one per window with --chain-prompts"
         )
 
+    # Resolved after the --draft-seconds/--draft-fps output renames, so the preview directory
+    # always sits beside the mp4 that will actually be written.
+    live_preview_dir = None
+    if args.live_preview != "off":
+        live_preview_dir = (
+            args.live_preview_dir
+            if args.live_preview_dir is not None
+            else args.output.parent / "live"
+        )
+
     device = mx.device_info()
     max_wired = int(device["max_recommended_working_set_size"])
     wired_bytes = min(int(args.wired_gb * 1024**3), max_wired - 1024**2)
@@ -1082,6 +1207,21 @@ def main() -> int:
         "prompt_cache": str(args.prompt_cache) if args.prompt_cache else None,
         "draft_decode": args.draft_decode,
         "tae_checkpoint": str(args.tae_checkpoint) if args.tae_checkpoint else None,
+        "live_preview": args.live_preview,
+        "live_preview_every": args.live_preview_every if args.live_preview != "off" else None,
+        "live_preview_dir": str(live_preview_dir) if live_preview_dir else None,
+        "live_preview_context": (
+            (
+                LIVE_PREVIEW_DEFAULT_CONTEXT
+                if args.live_preview_context is None
+                else args.live_preview_context
+            )
+            if args.live_preview != "off"
+            else None
+        ),
+        "live_preview_downscale": (
+            args.live_preview_downscale if args.live_preview != "off" else None
+        ),
         "draft_cache_dir": str(args.draft_cache_dir) if args.draft_cache_dir else None,
         "draft_cache_limit": args.draft_cache_limit if args.draft_cache_dir else None,
         "draft_seconds": args.draft_seconds,
@@ -1122,6 +1262,33 @@ def main() -> int:
     total_started = time.perf_counter()
     mx.set_wired_limit(wired_bytes)
     mx.set_memory_limit(memory_bytes)
+
+    live_preview = None
+    if args.live_preview != "off":
+        # Built before any large model loads, so the 23 MB decoder is resident from the first
+        # forward and its load never lands inside a measured step.
+        live_preview = LivePreviewMonitor(
+            live_preview_dir,
+            args.tae_checkpoint,
+            total_forwards=(args.steps - 1) * chain,
+            total_windows=chain,
+            sigma_points=args.steps,
+            output=args.output,
+            every=args.live_preview_every,
+            latent_frame=args.live_preview_latent_frame,
+            context=(
+                LIVE_PREVIEW_DEFAULT_CONTEXT
+                if args.live_preview_context is None
+                else args.live_preview_context
+            ),
+            downscale=args.live_preview_downscale,
+        )
+        print(
+            f"live preview: {live_preview.directory} "
+            f"(every {live_preview.every} of {live_preview.total_forwards} forwards; "
+            f"abort with `touch {live_preview.abort_path}`)",
+            flush=True,
+        )
 
     try:
         base_keyframe = None
@@ -1179,6 +1346,8 @@ def main() -> int:
                 keyframe=keyframe,
                 first_frame_key=first_frame_key,
                 prompt_cache=prompt_cache,
+                live_preview=live_preview,
+                window_index=index + 1,
             )
             segments.append((video, audio))
             step_times.extend(window_steps)
@@ -1266,9 +1435,28 @@ def main() -> int:
                 "denoise_step_seconds": [round(value, 3) for value in step_times],
             }
         )
+        if live_preview is not None:
+            record.data["live_preview"] = live_preview.summary()
+            live_preview.finish("done", extra={"output_written": str(args.output)})
         record.flush()
         print(f"\nwrote {args.output} in {record.data['total_seconds']/60:.1f} min")
         return 0
+    except LivePreviewAborted as exc:
+        # A clean stop, not a failure: nothing has been encoded yet, so there is no partial mp4 to
+        # clean up, and the metrics file records where the run got to.
+        record.data.update(
+            {
+                "status": "aborted",
+                "aborted_by": "live-preview ABORT sentinel",
+                "error": str(exc),
+                "total_seconds": round(time.perf_counter() - total_started, 3),
+            }
+        )
+        if live_preview is not None:
+            record.data["live_preview"] = live_preview.summary()
+        record.flush()
+        print(f"\nABORTED: {exc}", flush=True)
+        return ABORT_EXIT_CODE
     except BaseException as exc:
         record.data.update(
             {
@@ -1278,6 +1466,9 @@ def main() -> int:
                 "total_seconds": round(time.perf_counter() - total_started, 3),
             }
         )
+        if live_preview is not None:
+            record.data["live_preview"] = live_preview.summary()
+            live_preview.finish("error", extra={"error": f"{type(exc).__name__}: {exc}"})
         record.flush()
         raise
 
