@@ -49,6 +49,15 @@ ABORT_FILENAME = "ABORT"
 STATUS_FILENAME = "status.json"
 LATEST_FILENAME = "preview_latest.png"
 
+#: The animated companion to LATEST_FILENAME: the warm-up frames the decode already
+#: produced, written as one looping WebP. Same decode, so it costs no GPU.
+LOOP_FILENAME = "preview_latest.webp"
+#: Milliseconds per loop frame. The decoder emits four pixel frames per latent token
+#: at 25 fps, so 40 ms plays the moments back at the speed they were generated at.
+LOOP_FRAME_MS = 40
+#: A monitor, not a deliverable — trade bytes and encode time for fidelity.
+LOOP_QUALITY = 60
+
 
 class LivePreviewAborted(RuntimeError):
     """Raised between forwards when the ABORT sentinel appears."""
@@ -152,6 +161,8 @@ class LivePreviewMonitor:
         self.abort_path = self.directory / ABORT_FILENAME
         self.status_path = self.directory / STATUS_FILENAME
         self.latest_path = self.directory / LATEST_FILENAME
+        self.loop_path = self.directory / LOOP_FILENAME
+        self._loop_frames = 0
 
         self.total_forwards = int(total_forwards)
         self.total_windows = int(total_windows)
@@ -315,7 +326,8 @@ class LivePreviewMonitor:
         index = local_output_index(context)
         decoded = self.tae.decode(latents, index + 1)
         mx.eval(decoded)
-        frame = np.array(decoded)[0, :, index].transpose(1, 2, 0)
+        stack = np.array(decoded)[0]  # (C, T, H, W)
+        frame = stack[:, index].transpose(1, 2, 0)
         image = (np.clip(frame, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
 
         from PIL import Image
@@ -328,6 +340,43 @@ class LivePreviewMonitor:
         _atomic_write(path, payload)
         _atomic_write(self.latest_path, payload)
         self._last_preview = path
+
+        # THE LOOP IS ALREADY DECODED. `context` latent tokens of causal warm-up
+        # exist so the target frame does not smear (see DEFAULT_CONTEXT), and the
+        # decoder emits a PIXEL frame for every one of them — `index + 1` frames
+        # in `stack`, of which the single line above used exactly one and threw
+        # the rest away. They are the moments immediately BEFORE the previewed
+        # one, in order, so writing them out as an animated WebP turns the still
+        # into ~half a second of real motion for NO extra GPU work: same decode,
+        # same tensors, only a handful of extra encodes.
+        #
+        # WebP because the panel already serves image/webp and a browser loops an
+        # animated one on its own — no polling, no player, no client state. The
+        # PNG above stays exactly as it was, so any consumer that wants a still
+        # (and every older panel) is untouched.
+        if stack.shape[1] > 1:
+            try:
+                seq = np.clip(stack.transpose(1, 2, 3, 0), 0.0, 1.0)
+                seq = (seq * 255.0 + 0.5).astype(np.uint8)
+                frames = [Image.fromarray(f) for f in seq]
+                loop_buffer = io.BytesIO()
+                frames[0].save(
+                    loop_buffer,
+                    format="WEBP",
+                    save_all=True,
+                    append_images=frames[1:],
+                    duration=LOOP_FRAME_MS,
+                    loop=0,
+                    quality=LOOP_QUALITY,
+                    method=0,  # fastest encoder setting: this is a monitor, not a deliverable
+                )
+                _atomic_write(self.loop_path, loop_buffer.getvalue())
+                self._loop_frames = len(frames)
+            except Exception:
+                # A monitor must never be able to fail a render. If WebP is
+                # unavailable in this Pillow build, the still above already
+                # shipped and the panel falls back to it.
+                self._loop_frames = 0
 
         del x0_rows, latents, decoded
         cost = time.perf_counter() - started
@@ -351,6 +400,10 @@ class LivePreviewMonitor:
             "total_windows": self.total_windows,
             "sigma_points": self.sigma_points,
             "preview": self._last_preview.name if self._last_preview else None,
+            # The animated companion, named only once it exists. A consumer that
+            # does not know the key keeps using `preview` and sees a still.
+            "preview_loop": LOOP_FILENAME if self._loop_frames else None,
+            "preview_loop_frames": self._loop_frames or None,
             "preview_path": str(self._last_preview) if self._last_preview else None,
             "preview_latest_path": str(self.latest_path) if self._last_preview else None,
             "abort_sentinel": str(self.abort_path),
