@@ -28,6 +28,8 @@ as skipped with the reason, never silently dropped. See :func:`plan` and the not
 
 from __future__ import annotations
 
+import json
+import struct
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -127,6 +129,46 @@ def load_pairs(path: str | Path) -> dict[str, tuple[mx.array, mx.array]]:
     return pairs
 
 
+FC1_SUFFIX = ".mlp.fc1"
+
+
+def file_layout(path: str | Path) -> str:
+    """The layout a LoRA DECLARES, from its own safetensors metadata, or "".
+
+    Kijai's conversions stamp ``converted_layout`` (e.g. ``comfyui_minimax_h3``)
+    and spell the transformations out in ``conversion``:
+
+        qkv block-diag fused (contiguous q|k|v); mlp.fc1 swiglu halves swapped
+
+    Reading that beats assuming it. Files without metadata (most of CivitAI)
+    return "" and fall back to the caller's defaults.
+    """
+    try:
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            head = json.loads(f.read(n))
+        return str((head.get("__metadata__") or {}).get("converted_layout") or "")
+    except Exception:
+        return ""
+
+
+def _swap_fc1_halves(b: mx.array) -> mx.array:
+    """``lora_B`` rows ``[value; gate]`` -> ``[gate; value]``.
+
+    ``fc1`` is a fused SwiGLU projection and our ``FeedForward`` reads it as
+    ``[gate; value]`` (dit.py). The ComfyUI definition stores the halves the
+    other way round, so a ComfyUI-lineage LoRA applied verbatim puts the gate
+    update on the value path and the value update on the gate path. The result
+    still renders — it is a plausible-looking, quietly wrong MLP.
+
+    Rows, not columns: ``lora_A`` addresses the INPUT (hidden_size), which both
+    layouts agree on, so only ``B`` is reordered.
+    """
+    out = b.shape[0]
+    half = out // 2
+    return mx.concatenate([b[half:], b[:half]], axis=0)
+
+
 def _permute_qkv_rows(b: mx.array, heads: int, head_dim: int) -> mx.array:
     """``lora_B`` rows ``(3, heads, head_dim)`` -> ``(heads, 3, head_dim)``.
 
@@ -191,17 +233,32 @@ def plan(
     model,
     pairs: dict[str, tuple[mx.array, mx.array]],
     *,
-    permute_qkv: bool = True,
+    permute_qkv: bool = False,
+    swap_fc1: bool = False,
 ) -> tuple[dict, list[ModuleReport]]:
     """Split the LoRA into what this checkpoint can take and what it cannot, with reasons.
 
-    ``permute_qkv`` exists because the row-order remap documented at the top of
-    this module is an ASSUMPTION about the file's training lineage, applied to
-    every LoRA with no way to check it. It is right for anything trained
-    through the ComfyUI definition (most of CivitAI) and catastrophic for
-    anything trained against this checkpoint's native layout — and the failure
-    is silent either way, presenting as "the effect works but faces are wrong".
-    Off is the diagnostic arm."""
+MEASURED 2026-08-15 — both transforms default OFF, because the files we
+    actually load are already in this checkpoint's layout.
+
+    The same adapter exists in two places: our own repack
+    (``lightx2v_v1.0_768p_ourlayout``) and Kijai's rank-resized conversion,
+    whose metadata declares ``converted_layout: comfyui_minimax_h3``. Comparing
+    the effective delta ``B @ A`` module by module between them:
+
+        qkv_proj   as-is +0.975   permuted +0.012
+        mlp.fc1    as-is +0.962   swapped  +0.002
+        out_proj   as-is +0.968   (no transform involved)
+        fc2        as-is +0.962   (no transform involved)
+
+    +0.012 is orthogonal. Applying the permute does not translate the adapter
+    into our layout, it rotates it into something that is not the adapter —
+    and it had been running unconditionally on every H3 LoRA, our shipped
+    Turbo adapter included. The render-level effect is subtle (the delta is
+    ~1% of base, so a wrong 1% still looks like a plausible clip) which is
+    exactly why it survived: nothing ever looked broken.
+
+    Both flags stay as opt-in triage for a file that genuinely needs them."""
     targets = _iter_targets(model)
     applicable: dict[str, tuple[nn.Module, str, mx.array, mx.array]] = {}
     skipped: list[ModuleReport] = []
@@ -241,6 +298,8 @@ def plan(
             continue
         if permute_qkv and name.endswith(QKV_SUFFIX):
             b = _permute_qkv_rows(b, heads, head_dim)
+        if swap_fc1 and name.endswith(FC1_SUFFIX):
+            b = _swap_fc1_halves(b)
         applicable[name] = (parent, attr, a, b)
     return applicable, skipped
 
@@ -251,7 +310,8 @@ def apply_lora(
     scale: float = 1.0,
     mode: str = "runtime",
     verbose: bool = True,
-    permute_qkv: bool = True,
+    permute_qkv: bool = False,
+    swap_fc1: bool = False,
 ) -> LoRAReport:
     """Attach (``runtime``) or merge (``fuse``) a LoRA onto a loaded DiT.
 
@@ -262,7 +322,7 @@ def apply_lora(
         raise ValueError(f"lora mode must be 'runtime' or 'fuse', got {mode!r}")
     started = time.perf_counter()
     pairs = load_pairs(path)
-    applicable, skipped = plan(model, pairs, permute_qkv=permute_qkv)
+    applicable, skipped = plan(model, pairs, permute_qkv=permute_qkv, swap_fc1=swap_fc1)
     report = LoRAReport(path=str(path), scale=float(scale), mode=mode, skipped=skipped)
 
     for name, (parent, attr, a, b) in applicable.items():

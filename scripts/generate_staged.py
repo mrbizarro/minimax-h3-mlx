@@ -485,7 +485,8 @@ def render_window(
                     lora_scale,
                     mode=getattr(args, "lora_mode", "runtime"),
                     verbose=True,
-                    permute_qkv=not getattr(args, "lora_no_qkv_permute", False),
+                    permute_qkv=bool(getattr(args, "lora_qkv_permute", False)),
+                    swap_fc1=bool(getattr(args, "lora_fc1_swap", False)),
                 )
                 record.data[f"{label}lora"] = lora_report.summary()
             else:
@@ -981,9 +982,17 @@ def main() -> int:
         "and is folded into the precomputed modulation cache, so it costs nothing per forward.",
     )
     parser.add_argument(
-        "--lora-no-qkv-permute",
+        "--lora-fc1-swap",
         action="store_true",
-        help="Do NOT re-order the fused qkv rows of lora_B. The remap assumes the LoRA was "
+        help="Swap the fused mlp.fc1 SwiGLU halves of lora_B (OFF by default). Our FeedForward reads fc1 "
+             "as [gate; value]; the ComfyUI definition stores [value; gate], so a ComfyUI-lineage "
+             "LoRA applied verbatim puts the gate update on the value path. Kijai's conversions "
+             "declare this in their own metadata (conversion: 'mlp.fc1 swiglu halves swapped').",
+    )
+    parser.add_argument(
+        "--lora-qkv-permute",
+        action="store_true",
+        help="Re-order the fused qkv rows of lora_B (OFF by default; measured wrong for every converted file). The remap assumes the LoRA was "
              "trained through the ComfyUI model definition ((3, heads, head_dim)); this "
              "checkpoint stores (heads, 3, head_dim). Right for most CivitAI files, silent "
              "corruption for anything trained against the native layout — and corrupted "

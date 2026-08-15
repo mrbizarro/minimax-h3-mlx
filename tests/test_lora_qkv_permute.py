@@ -6,13 +6,19 @@ trained through the ComfyUI model definition stores fused qkv rows as
 apply the remap to every file because nothing in a safetensors LoRA states its
 lineage.
 
-Measured 2026-08-15 on the CivitAI file (epic_cumshots-MiniMaxH3), 640x384,
-73f, 4 steps, permute ON vs OFF at two seeds: seed 0 favoured OFF, seed 1
-favoured ON, both inside ordinary seed-to-seed variance. The permute is NOT the
-cause of soft eyes/faces on downloaded H3 LoRAs — that is the canvas (a face on
-the 640x384 draft and 768x448 standard canvases is ~100px tall). Keep the flag
-as a triage tool for a file that genuinely looks scrambled; do not flip the
-default on a hunch.
+SETTLED 2026-08-15 by measurement, not by eye. The same adapter exists as our
+own repack (lightx2v_v1.0_768p_ourlayout) and as Kijai's rank-resized
+conversion declaring `converted_layout: comfyui_minimax_h3`. Cosine of the
+effective delta B@A between the two, per module:
+
+    qkv_proj   as-is +0.975   permuted +0.012
+    mlp.fc1    as-is +0.962   swapped  +0.002
+
+The converted files are ALREADY in this checkpoint's layout, so both
+transforms are wrong and both now default OFF. +0.012 is orthogonal: the
+permute was not translating the adapter, it was replacing it. It ran on every
+H3 LoRA including our shipped Turbo. Render-level it is subtle — the delta is
+~1% of base — which is why it survived so long.
 """
 
 import unittest
@@ -100,11 +106,10 @@ class QkvPermuteSwitch(unittest.TestCase):
         _, _, _, b = applicable[self.name]
         self.assertTrue(mx.array_equal(b, self.b))
 
-    def test_default_is_on(self):
-        """The default is the shipped behaviour; OFF is opt-in triage only."""
+    def test_default_is_off(self):
+        """Default must pass rows through — the transforms are opt-in triage."""
         default, _ = lora_mod.plan(self.model, self.pairs)
-        forced, _ = lora_mod.plan(self.model, self.pairs, permute_qkv=True)
-        self.assertTrue(mx.array_equal(default[self.name][3], forced[self.name][3]))
+        self.assertTrue(mx.array_equal(default[self.name][3], self.b))
 
     def test_permute_is_its_own_inverse_on_this_shape(self):
         """3 and heads=4 do not commute, so OFF is not reachable by permuting twice.
@@ -118,3 +123,22 @@ class QkvPermuteSwitch(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Fc1HalfSwap(unittest.TestCase):
+    """The fused SwiGLU projection, and why it is left alone by default."""
+
+    def test_swap_exchanges_the_halves(self):
+        b = mx.arange(8).reshape(8, 1).astype(mx.float32)
+        out = lora_mod._swap_fc1_halves(b)
+        self.assertEqual([float(x) for x in out.reshape(-1)],
+                         [4.0, 5.0, 6.0, 7.0, 0.0, 1.0, 2.0, 3.0])
+
+    def test_swap_is_its_own_inverse(self):
+        b = mx.random.normal((16, 3))
+        self.assertTrue(mx.array_equal(
+            lora_mod._swap_fc1_halves(lora_mod._swap_fc1_halves(b)), b))
+
+    def test_file_layout_is_empty_without_metadata(self):
+        """A file we cannot read must not be reported as declaring a layout."""
+        self.assertEqual(lora_mod.file_layout("/nonexistent/none.safetensors"), "")
