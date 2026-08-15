@@ -485,6 +485,7 @@ def render_window(
                     lora_scale,
                     mode=getattr(args, "lora_mode", "runtime"),
                     verbose=True,
+                    permute_qkv=not getattr(args, "lora_no_qkv_permute", False),
                 )
                 record.data[f"{label}lora"] = lora_report.summary()
             else:
@@ -978,6 +979,16 @@ def main() -> int:
         help="Also apply the LoRA's adaLN modules, which the pruned checkpoint cannot wrap. Needs "
         "the upstream time_embedder tensors (scripts/fetch_time_embedder.py); the delta is exact "
         "and is folded into the precomputed modulation cache, so it costs nothing per forward.",
+    )
+    parser.add_argument(
+        "--lora-no-qkv-permute",
+        action="store_true",
+        help="Do NOT re-order the fused qkv rows of lora_B. The remap assumes the LoRA was "
+             "trained through the ComfyUI model definition ((3, heads, head_dim)); this "
+             "checkpoint stores (heads, 3, head_dim). Right for most CivitAI files, silent "
+             "corruption for anything trained against the native layout — and corrupted "
+             "attention presents as 'the effect works but faces and eyes are wrong'. Use this "
+             "to test which lineage a file actually came from.",
     )
     parser.add_argument(
         "--lora-audit",

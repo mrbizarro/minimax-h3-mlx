@@ -187,8 +187,21 @@ class LoRALinear(nn.Module):
         return y + delta
 
 
-def plan(model, pairs: dict[str, tuple[mx.array, mx.array]]) -> tuple[dict, list[ModuleReport]]:
-    """Split the LoRA into what this checkpoint can take and what it cannot, with reasons."""
+def plan(
+    model,
+    pairs: dict[str, tuple[mx.array, mx.array]],
+    *,
+    permute_qkv: bool = True,
+) -> tuple[dict, list[ModuleReport]]:
+    """Split the LoRA into what this checkpoint can take and what it cannot, with reasons.
+
+    ``permute_qkv`` exists because the row-order remap documented at the top of
+    this module is an ASSUMPTION about the file's training lineage, applied to
+    every LoRA with no way to check it. It is right for anything trained
+    through the ComfyUI definition (most of CivitAI) and catastrophic for
+    anything trained against this checkpoint's native layout — and the failure
+    is silent either way, presenting as "the effect works but faces are wrong".
+    Off is the diagnostic arm."""
     targets = _iter_targets(model)
     applicable: dict[str, tuple[nn.Module, str, mx.array, mx.array]] = {}
     skipped: list[ModuleReport] = []
@@ -226,7 +239,7 @@ def plan(model, pairs: dict[str, tuple[mx.array, mx.array]]) -> tuple[dict, list
                 f"shape mismatch: base [{out_dim}, {in_dim}] vs B[{b.shape[0]}] A[{a.shape[1]}]",
                 rank, tuple(b.shape)))
             continue
-        if name.endswith(QKV_SUFFIX):
+        if permute_qkv and name.endswith(QKV_SUFFIX):
             b = _permute_qkv_rows(b, heads, head_dim)
         applicable[name] = (parent, attr, a, b)
     return applicable, skipped
@@ -238,6 +251,7 @@ def apply_lora(
     scale: float = 1.0,
     mode: str = "runtime",
     verbose: bool = True,
+    permute_qkv: bool = True,
 ) -> LoRAReport:
     """Attach (``runtime``) or merge (``fuse``) a LoRA onto a loaded DiT.
 
@@ -248,12 +262,12 @@ def apply_lora(
         raise ValueError(f"lora mode must be 'runtime' or 'fuse', got {mode!r}")
     started = time.perf_counter()
     pairs = load_pairs(path)
-    applicable, skipped = plan(model, pairs)
+    applicable, skipped = plan(model, pairs, permute_qkv=permute_qkv)
     report = LoRAReport(path=str(path), scale=float(scale), mode=mode, skipped=skipped)
 
     for name, (parent, attr, a, b) in applicable.items():
         base = getattr(parent, attr)
-        if name.endswith(QKV_SUFFIX):
+        if permute_qkv and name.endswith(QKV_SUFFIX):
             report.permuted_qkv += 1
         if mode == "runtime":
             setattr(parent, attr, LoRALinear(base, a, b, scale))
