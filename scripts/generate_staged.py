@@ -19,6 +19,8 @@ from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
+import atexit
+atexit.register(mx.clear_streams)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
