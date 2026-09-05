@@ -20,6 +20,17 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
+# Since ml-explore/mlx#4248 the runtime no longer registers its own exit-time
+# cleanup: without this, stream/compile-cache teardown runs during static
+# destruction after the interpreter is gone and aborts with
+# "PyThreadState_Get: the function must be called with the GIL held" —
+# AFTER the MP4 was written, so the panel called a finished render a failure
+# (Phosphene #76, diagnosed and verified by @PhantombrainM). Guarded so an
+# older mlx without clear_streams keeps working.
+import atexit
+if hasattr(mx, "clear_streams"):
+    atexit.register(mx.clear_streams)
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from minimax_h3_mlx.adaln import ModulationCache, drop_adaln_weights
