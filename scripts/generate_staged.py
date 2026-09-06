@@ -478,34 +478,45 @@ def render_window(
                     record.data[f"{label}keyframe_cache_hit"] = False
         release()
 
-    lora_path = None
-    lora_scale = None
+    # `--lora` repeats: every PATH[:SCALE] is one adapter, and they stack as a
+    # sum of independent low-rank deltas on the same base layers (lora.py,
+    # LoRALinear). Turbo plus a character LoRA is the case this exists for.
+    # `lora_stack` is the ordered list of (path, scale); a single adapter is a
+    # one-element list, so every consumer below handles one shape.
+    lora_stack: list[tuple[Path, float]] = []
     with record.phase(f"{label}dit_load_bf16"):
         dit = load_dit(args.dit, verbose=True)
         patch = dit.config.patch_size
         lora_spec = getattr(args, "lora", None)
-        if lora_spec:
+        lora_specs = [lora_spec] if isinstance(lora_spec, (str, Path)) else list(lora_spec or [])
+        lora_specs = [s for s in lora_specs if s]
+        if lora_specs:
             from minimax_h3_mlx import lora as lora_mod
 
             lora_mod.AUDIT = bool(getattr(args, "lora_audit", False))
-            lora_path, lora_scale = lora_mod.parse_spec(lora_spec)
+            lora_stack = [lora_mod.parse_spec(str(spec)) for spec in lora_specs]
             if not getattr(args, "lora_already_applied", False):
-                lora_report = lora_mod.apply_lora(
+                reports = lora_mod.apply_loras(
                     dit,
-                    lora_path,
-                    lora_scale,
+                    lora_stack,
                     mode=getattr(args, "lora_mode", "runtime"),
                     verbose=True,
                     permute_qkv=bool(getattr(args, "lora_qkv_permute", False)),
                     swap_fc1=bool(getattr(args, "lora_fc1_swap", False)),
                 )
-                record.data[f"{label}lora"] = lora_report.summary()
+                record.data[f"{label}lora"] = reports[0].summary()
+                if len(reports) > 1:
+                    record.data[f"{label}lora_stack"] = [r.summary() for r in reports]
             else:
                 record.data[f"{label}lora"] = {
-                    "path": str(lora_path),
-                    "scale": float(lora_scale),
+                    "path": str(lora_stack[0][0]),
+                    "scale": float(lora_stack[0][1]),
                     "mode": "resident-preapplied",
                 }
+                if len(lora_stack) > 1:
+                    record.data[f"{label}lora_stack"] = [
+                        {"path": str(p), "scale": float(sc), "mode": "resident-preapplied"}
+                        for p, sc in lora_stack]
             record.flush()
 
     layout = build_packed_sequence(
@@ -535,7 +546,7 @@ def render_window(
             adaln_key = draft_cache.adaln_key(
                 timestep_table=np.array(timestep_table),
                 dit=args.dit,
-                lora=(lora_path, lora_scale) if lora_path is not None else None,
+                lora=lora_stack or None,
                 lora_adaln=args.lora_adaln,
             )
             cached_adaln = draft_cache.load_adaln(adaln_key, dit)
@@ -548,7 +559,7 @@ def render_window(
             cache = ModulationCache.build(dit, timestep_table, dtype=mx.bfloat16)
             mx.eval(cache.tables)
             adaln_report = None
-            if getattr(args, "lora", None) and getattr(args, "lora_adaln", None):
+            if lora_stack and getattr(args, "lora_adaln", None):
                 from minimax_h3_mlx import lora as lora_mod
 
                 reused_resident_table = bool(
@@ -557,9 +568,15 @@ def render_window(
                 if reused_resident_table and hasattr(ModulationCache, "current_lora_report"):
                     adaln_report = ModulationCache.current_lora_report()
                 else:
-                    adaln_report = lora_mod.absorb_adaln_lora(
-                        dit, cache, lora_path, args.lora_adaln, lora_scale, verbose=True
-                    )
+                    # Each adapter's adaLN delta adds into the same tables; the
+                    # report is the last one, with the whole stack listed.
+                    stack_reports = [
+                        lora_mod.absorb_adaln_lora(
+                            dit, cache, lp, args.lora_adaln, ls, verbose=True
+                        ) for lp, ls in lora_stack]
+                    adaln_report = dict(stack_reports[-1])
+                    if len(stack_reports) > 1:
+                        adaln_report["stack"] = stack_reports
                     if hasattr(ModulationCache, "remember_lora_report"):
                         ModulationCache.remember_lora_report(adaln_report)
                 record.data[f"{label}lora_adaln"] = adaln_report
@@ -970,10 +987,13 @@ def main() -> int:
     parser.add_argument("--steps", type=int, default=9, help="sigma points; forwards = points - 1")
     parser.add_argument(
         "--lora",
+        action="append",
         default=None,
         metavar="PATH[:SCALE]",
         help="Apply a low-rank adapter to the DiT. SCALE defaults to 1.0 (these checkpoints ship "
-        "alpha == rank); SCALE 0 is a strict no-op and renders bit-identically to no --lora.",
+        "alpha == rank); SCALE 0 is a strict no-op and renders bit-identically to no --lora. "
+        "Repeat the flag to stack adapters (Turbo plus a character LoRA, say); each keeps its "
+        "own SCALE and the deltas add on the same base layers.",
     )
     parser.add_argument(
         "--lora-mode",

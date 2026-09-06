@@ -200,10 +200,30 @@ class LoRALinear(nn.Module):
     def __init__(self, base: nn.Module, a: mx.array, b: mx.array, scale: float):
         super().__init__()
         self.base = base
-        self.lora_a = a
-        self.lora_b = b
-        self.lora_scale = float(scale)
+        # One wrapper, N adapters. Stacking is a sum of independent low-rank
+        # deltas on the same base output, so a second LoRA is appended here
+        # rather than wrapped around the wrapper: nesting would hide the base's
+        # quantization metadata (`scales`) from `plan()`, which then compares
+        # the adapter against PACKED uint32 storage and skips every module —
+        # the applied=0 failure documented in `plan`.
+        self.lora_a = [a]
+        self.lora_b = [b]
+        self.lora_scales = [float(scale)]
         self._audit_ratio: float | None = None
+
+    @property
+    def lora_scale(self) -> float:         # the first adapter's scale, for callers that predate stacking
+        return self.lora_scales[0]
+
+    @property
+    def adapters(self) -> int:
+        return len(self.lora_a)
+
+    def add(self, a: mx.array, b: mx.array, scale: float) -> None:
+        """Stack another adapter on the same base layer."""
+        self.lora_a.append(a)
+        self.lora_b.append(b)
+        self.lora_scales.append(float(scale))
 
     @property
     def weight(self) -> mx.array:          # keeps `param_dtype()` working through the wrapper
@@ -211,12 +231,16 @@ class LoRALinear(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         y = self.base(x)
-        if self.lora_scale == 0.0:
+        delta = None
+        for a, b, scale in zip(self.lora_a, self.lora_b, self.lora_scales):
+            if scale == 0.0:
+                continue
+            part = (x.astype(a.dtype) @ a.T) @ b.T
+            if scale != 1.0:
+                part = part * scale
+            delta = part if delta is None else delta + part.astype(delta.dtype)
+        if delta is None:
             return y
-        mid = x.astype(self.lora_a.dtype) @ self.lora_a.T
-        delta = mid @ self.lora_b.T
-        if self.lora_scale != 1.0:
-            delta = delta * self.lora_scale
         delta = delta.astype(y.dtype)
         if AUDIT and self._audit_ratio is None:
             # Weight-space size (3.4e-4 of |W|) does not tell us whether the update survives the
@@ -278,6 +302,8 @@ MEASURED 2026-08-15 — both transforms default OFF, because the files we
             continue
         parent, attr = targets[name]
         base = getattr(parent, attr)
+        if isinstance(base, LoRALinear):
+            base = base.base          # an adapter is already attached: inspect the layer under it
         # QuantizedLinear stores PACKED uint32 rows: weight is (out, in*bits/32),
         # and comparing a LoRA's logical dims against packed storage skipped all
         # 208 modules on the Q8 DiT — silently, with the render still "working"
@@ -330,7 +356,16 @@ def apply_lora(
         if permute_qkv and name.endswith(QKV_SUFFIX):
             report.permuted_qkv += 1
         if mode == "runtime":
-            setattr(parent, attr, LoRALinear(base, a, b, scale))
+            if isinstance(base, LoRALinear):
+                base.add(a, b, scale)
+            else:
+                setattr(parent, attr, LoRALinear(base, a, b, scale))
+        elif isinstance(base, LoRALinear):
+            skipped.append(ModuleReport(
+                name, "skipped",
+                "fuse mode cannot merge under a runtime adapter — stack in runtime mode",
+                int(a.shape[0]), tuple(b.shape)))
+            continue
         elif getattr(base, "scales", None) is not None:
             # Fusing into a QuantizedLinear would add a bf16 delta to PACKED
             # uint32 storage — silent weight corruption, not a merge. Runtime
@@ -399,6 +434,12 @@ def silu_temb(timesteps: mx.array, embedder_path: str | Path) -> mx.array:
     return nn.silu(temb.astype(mx.float32))
 
 
+def apply_loras(model, specs, mode: str = "runtime", verbose: bool = True, **kw) -> list:
+    """Apply several ``(path, scale)`` adapters in order. Runtime mode stacks
+    them on the same base layers; every adapter gets its own report."""
+    return [apply_lora(model, path, scale, mode=mode, verbose=verbose, **kw) for path, scale in specs]
+
+
 def absorb_adaln_lora(
     dit,
     cache,
@@ -453,9 +494,11 @@ def absorb_adaln_lora(
         a, b = adaln[final_key]
         # The final layer re-projects every forward instead of reading a table, so the delta is
         # parked on the module and added inside `FinalLayer.norm_out`.
-        dit.final_layer.adaln_proj.lora_delta = (
-            ((st @ a.astype(mx.float32).T) @ b.astype(mx.float32).T) * scale
-        )
+        final_delta = ((st @ a.astype(mx.float32).T) @ b.astype(mx.float32).T) * scale
+        previous = getattr(dit.final_layer.adaln_proj, "lora_delta", None)
+        if previous is not None:
+            final_delta = previous + final_delta     # a second adaLN LoRA adds to the first, not over it
+        dit.final_layer.adaln_proj.lora_delta = final_delta
         mx.eval(dit.final_layer.adaln_proj.lora_delta)
         final = True
 
