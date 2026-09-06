@@ -75,17 +75,25 @@ class DraftCache:
     @staticmethod
     def adaln_key(*, timestep_table: np.ndarray, dit, lora, lora_adaln) -> str:
         table = np.ascontiguousarray(timestep_table, dtype=np.float32)
-        lora_path, lora_scale = lora if lora else (None, None)
-        return _json_key(
-            "adaln",
-            {
-                "timesteps_sha256": hashlib.sha256(table.tobytes()).hexdigest(),
-                "dit": path_fingerprint(dit),
-                "lora": path_fingerprint(lora_path),
-                "lora_scale": float(lora_scale) if lora_scale is not None else None,
-                "lora_adaln": path_fingerprint(lora_adaln),
-            },
-        )
+        # `lora` is one (path, scale) pair or a list of them. A single adapter
+        # keeps the historical key shape so existing caches stay valid; a stack
+        # is keyed on the sorted set, so order of the flags does not matter.
+        stack = []
+        if lora:
+            stack = list(lora) if isinstance(lora, (list, tuple)) and lora and isinstance(lora[0], (list, tuple)) else [lora]
+        stack = [(p, float(s) if s is not None else None) for p, s in stack if p is not None]
+        fields = {
+            "timesteps_sha256": hashlib.sha256(table.tobytes()).hexdigest(),
+            "dit": path_fingerprint(dit),
+            "lora": path_fingerprint(stack[0][0]) if len(stack) == 1 else None,
+            "lora_scale": stack[0][1] if len(stack) == 1 else None,
+            "lora_adaln": path_fingerprint(lora_adaln),
+        }
+        if len(stack) > 1:
+            fields["lora_stack"] = sorted(
+                ({"lora": path_fingerprint(p), "scale": s} for p, s in stack),
+                key=lambda d: d["lora"]["path"])
+        return _json_key("adaln", fields)
 
     @staticmethod
     def noise_key(

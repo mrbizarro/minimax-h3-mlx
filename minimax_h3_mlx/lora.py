@@ -28,6 +28,8 @@ as skipped with the reason, never silently dropped. See :func:`plan` and the not
 
 from __future__ import annotations
 
+import json
+import struct
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -127,6 +129,46 @@ def load_pairs(path: str | Path) -> dict[str, tuple[mx.array, mx.array]]:
     return pairs
 
 
+FC1_SUFFIX = ".mlp.fc1"
+
+
+def file_layout(path: str | Path) -> str:
+    """The layout a LoRA DECLARES, from its own safetensors metadata, or "".
+
+    Kijai's conversions stamp ``converted_layout`` (e.g. ``comfyui_minimax_h3``)
+    and spell the transformations out in ``conversion``:
+
+        qkv block-diag fused (contiguous q|k|v); mlp.fc1 swiglu halves swapped
+
+    Reading that beats assuming it. Files without metadata (most of CivitAI)
+    return "" and fall back to the caller's defaults.
+    """
+    try:
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            head = json.loads(f.read(n))
+        return str((head.get("__metadata__") or {}).get("converted_layout") or "")
+    except Exception:
+        return ""
+
+
+def _swap_fc1_halves(b: mx.array) -> mx.array:
+    """``lora_B`` rows ``[value; gate]`` -> ``[gate; value]``.
+
+    ``fc1`` is a fused SwiGLU projection and our ``FeedForward`` reads it as
+    ``[gate; value]`` (dit.py). The ComfyUI definition stores the halves the
+    other way round, so a ComfyUI-lineage LoRA applied verbatim puts the gate
+    update on the value path and the value update on the gate path. The result
+    still renders — it is a plausible-looking, quietly wrong MLP.
+
+    Rows, not columns: ``lora_A`` addresses the INPUT (hidden_size), which both
+    layouts agree on, so only ``B`` is reordered.
+    """
+    out = b.shape[0]
+    half = out // 2
+    return mx.concatenate([b[half:], b[:half]], axis=0)
+
+
 def _permute_qkv_rows(b: mx.array, heads: int, head_dim: int) -> mx.array:
     """``lora_B`` rows ``(3, heads, head_dim)`` -> ``(heads, 3, head_dim)``.
 
@@ -158,10 +200,30 @@ class LoRALinear(nn.Module):
     def __init__(self, base: nn.Module, a: mx.array, b: mx.array, scale: float):
         super().__init__()
         self.base = base
-        self.lora_a = a
-        self.lora_b = b
-        self.lora_scale = float(scale)
+        # One wrapper, N adapters. Stacking is a sum of independent low-rank
+        # deltas on the same base output, so a second LoRA is appended here
+        # rather than wrapped around the wrapper: nesting would hide the base's
+        # quantization metadata (`scales`) from `plan()`, which then compares
+        # the adapter against PACKED uint32 storage and skips every module —
+        # the applied=0 failure documented in `plan`.
+        self.lora_a = [a]
+        self.lora_b = [b]
+        self.lora_scales = [float(scale)]
         self._audit_ratio: float | None = None
+
+    @property
+    def lora_scale(self) -> float:         # the first adapter's scale, for callers that predate stacking
+        return self.lora_scales[0]
+
+    @property
+    def adapters(self) -> int:
+        return len(self.lora_a)
+
+    def add(self, a: mx.array, b: mx.array, scale: float) -> None:
+        """Stack another adapter on the same base layer."""
+        self.lora_a.append(a)
+        self.lora_b.append(b)
+        self.lora_scales.append(float(scale))
 
     @property
     def weight(self) -> mx.array:          # keeps `param_dtype()` working through the wrapper
@@ -169,12 +231,16 @@ class LoRALinear(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         y = self.base(x)
-        if self.lora_scale == 0.0:
+        delta = None
+        for a, b, scale in zip(self.lora_a, self.lora_b, self.lora_scales):
+            if scale == 0.0:
+                continue
+            part = (x.astype(a.dtype) @ a.T) @ b.T
+            if scale != 1.0:
+                part = part * scale
+            delta = part if delta is None else delta + part.astype(delta.dtype)
+        if delta is None:
             return y
-        mid = x.astype(self.lora_a.dtype) @ self.lora_a.T
-        delta = mid @ self.lora_b.T
-        if self.lora_scale != 1.0:
-            delta = delta * self.lora_scale
         delta = delta.astype(y.dtype)
         if AUDIT and self._audit_ratio is None:
             # Weight-space size (3.4e-4 of |W|) does not tell us whether the update survives the
@@ -187,8 +253,36 @@ class LoRALinear(nn.Module):
         return y + delta
 
 
-def plan(model, pairs: dict[str, tuple[mx.array, mx.array]]) -> tuple[dict, list[ModuleReport]]:
-    """Split the LoRA into what this checkpoint can take and what it cannot, with reasons."""
+def plan(
+    model,
+    pairs: dict[str, tuple[mx.array, mx.array]],
+    *,
+    permute_qkv: bool = False,
+    swap_fc1: bool = False,
+) -> tuple[dict, list[ModuleReport]]:
+    """Split the LoRA into what this checkpoint can take and what it cannot, with reasons.
+
+MEASURED 2026-08-15 — both transforms default OFF, because the files we
+    actually load are already in this checkpoint's layout.
+
+    The same adapter exists in two places: our own repack
+    (``lightx2v_v1.0_768p_ourlayout``) and Kijai's rank-resized conversion,
+    whose metadata declares ``converted_layout: comfyui_minimax_h3``. Comparing
+    the effective delta ``B @ A`` module by module between them:
+
+        qkv_proj   as-is +0.975   permuted +0.012
+        mlp.fc1    as-is +0.962   swapped  +0.002
+        out_proj   as-is +0.968   (no transform involved)
+        fc2        as-is +0.962   (no transform involved)
+
+    +0.012 is orthogonal. Applying the permute does not translate the adapter
+    into our layout, it rotates it into something that is not the adapter —
+    and it had been running unconditionally on every H3 LoRA, our shipped
+    Turbo adapter included. The render-level effect is subtle (the delta is
+    ~1% of base, so a wrong 1% still looks like a plausible clip) which is
+    exactly why it survived: nothing ever looked broken.
+
+    Both flags stay as opt-in triage for a file that genuinely needs them."""
     targets = _iter_targets(model)
     applicable: dict[str, tuple[nn.Module, str, mx.array, mx.array]] = {}
     skipped: list[ModuleReport] = []
@@ -208,6 +302,8 @@ def plan(model, pairs: dict[str, tuple[mx.array, mx.array]]) -> tuple[dict, list
             continue
         parent, attr = targets[name]
         base = getattr(parent, attr)
+        if isinstance(base, LoRALinear):
+            base = base.base          # an adapter is already attached: inspect the layer under it
         # QuantizedLinear stores PACKED uint32 rows: weight is (out, in*bits/32),
         # and comparing a LoRA's logical dims against packed storage skipped all
         # 208 modules on the Q8 DiT — silently, with the render still "working"
@@ -226,8 +322,10 @@ def plan(model, pairs: dict[str, tuple[mx.array, mx.array]]) -> tuple[dict, list
                 f"shape mismatch: base [{out_dim}, {in_dim}] vs B[{b.shape[0]}] A[{a.shape[1]}]",
                 rank, tuple(b.shape)))
             continue
-        if name.endswith(QKV_SUFFIX):
+        if permute_qkv and name.endswith(QKV_SUFFIX):
             b = _permute_qkv_rows(b, heads, head_dim)
+        if swap_fc1 and name.endswith(FC1_SUFFIX):
+            b = _swap_fc1_halves(b)
         applicable[name] = (parent, attr, a, b)
     return applicable, skipped
 
@@ -238,6 +336,8 @@ def apply_lora(
     scale: float = 1.0,
     mode: str = "runtime",
     verbose: bool = True,
+    permute_qkv: bool = False,
+    swap_fc1: bool = False,
 ) -> LoRAReport:
     """Attach (``runtime``) or merge (``fuse``) a LoRA onto a loaded DiT.
 
@@ -248,15 +348,24 @@ def apply_lora(
         raise ValueError(f"lora mode must be 'runtime' or 'fuse', got {mode!r}")
     started = time.perf_counter()
     pairs = load_pairs(path)
-    applicable, skipped = plan(model, pairs)
+    applicable, skipped = plan(model, pairs, permute_qkv=permute_qkv, swap_fc1=swap_fc1)
     report = LoRAReport(path=str(path), scale=float(scale), mode=mode, skipped=skipped)
 
     for name, (parent, attr, a, b) in applicable.items():
         base = getattr(parent, attr)
-        if name.endswith(QKV_SUFFIX):
+        if permute_qkv and name.endswith(QKV_SUFFIX):
             report.permuted_qkv += 1
         if mode == "runtime":
-            setattr(parent, attr, LoRALinear(base, a, b, scale))
+            if isinstance(base, LoRALinear):
+                base.add(a, b, scale)
+            else:
+                setattr(parent, attr, LoRALinear(base, a, b, scale))
+        elif isinstance(base, LoRALinear):
+            skipped.append(ModuleReport(
+                name, "skipped",
+                "fuse mode cannot merge under a runtime adapter — stack in runtime mode",
+                int(a.shape[0]), tuple(b.shape)))
+            continue
         elif getattr(base, "scales", None) is not None:
             # Fusing into a QuantizedLinear would add a bf16 delta to PACKED
             # uint32 storage — silent weight corruption, not a merge. Runtime
@@ -325,6 +434,12 @@ def silu_temb(timesteps: mx.array, embedder_path: str | Path) -> mx.array:
     return nn.silu(temb.astype(mx.float32))
 
 
+def apply_loras(model, specs, mode: str = "runtime", verbose: bool = True, **kw) -> list:
+    """Apply several ``(path, scale)`` adapters in order. Runtime mode stacks
+    them on the same base layers; every adapter gets its own report."""
+    return [apply_lora(model, path, scale, mode=mode, verbose=verbose, **kw) for path, scale in specs]
+
+
 def absorb_adaln_lora(
     dit,
     cache,
@@ -379,9 +494,11 @@ def absorb_adaln_lora(
         a, b = adaln[final_key]
         # The final layer re-projects every forward instead of reading a table, so the delta is
         # parked on the module and added inside `FinalLayer.norm_out`.
-        dit.final_layer.adaln_proj.lora_delta = (
-            ((st @ a.astype(mx.float32).T) @ b.astype(mx.float32).T) * scale
-        )
+        final_delta = ((st @ a.astype(mx.float32).T) @ b.astype(mx.float32).T) * scale
+        previous = getattr(dit.final_layer.adaln_proj, "lora_delta", None)
+        if previous is not None:
+            final_delta = previous + final_delta     # a second adaLN LoRA adds to the first, not over it
+        dit.final_layer.adaln_proj.lora_delta = final_delta
         mx.eval(dit.final_layer.adaln_proj.lora_delta)
         final = True
 

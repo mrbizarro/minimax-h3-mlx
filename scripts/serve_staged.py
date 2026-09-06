@@ -216,10 +216,11 @@ class ResidentEngine:
         if self.opts.lora:
             from minimax_h3_mlx import lora as lora_mod
 
-            lora_path, lora_scale = lora_mod.parse_spec(self.opts.lora)
-            self.lora_report = lora_mod.apply_lora(
-                self.dit, lora_path, lora_scale, mode="runtime", verbose=True
-            ).summary()
+            specs = [self.opts.lora] if isinstance(self.opts.lora, str) else list(self.opts.lora)
+            reports = lora_mod.apply_loras(
+                self.dit, [lora_mod.parse_spec(str(s)) for s in specs], mode="runtime", verbose=True
+            )
+            self.lora_report = reports[0].summary() if len(reports) == 1 else [r.summary() for r in reports]
         elapsed = time.perf_counter() - started
         self.dit_loads += 1
         self.dit_load_seconds += elapsed
@@ -574,7 +575,7 @@ def main() -> int:
     parser.add_argument("--dit", required=True)
     parser.add_argument("--compact-root", required=True)
     parser.add_argument("--text-config", default=None)
-    parser.add_argument("--lora", default=None)
+    parser.add_argument("--lora", action="append", default=None)   # repeatable: adapters stack
     parser.add_argument("--lora-adaln", default=None)
     parser.add_argument("--draft-decode", choices=("full", "tae"), default="full")
     parser.add_argument("--tae-checkpoint", default=None)
