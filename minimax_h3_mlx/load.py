@@ -71,6 +71,23 @@ def _metadata_json(metadata: dict[str, str], key: str) -> dict:
     return json.loads(value)
 
 
+def dit_precision(model_dir: str | Path) -> str:
+    """What a DiT path really holds, for logs and metrics: ``"q8"`` / ``"q4"`` / ``"bf16"``.
+
+    Reads the same ``quant_config.json`` :func:`load_dit` replays, so a phase or report that
+    names the precision cannot disagree with what was loaded. Cheap: no tensor is touched.
+    """
+    model_dir = Path(model_dir)
+    quant_path = model_dir / "quant_config.json" if model_dir.is_dir() else None
+    if quant_path is not None and quant_path.exists():
+        try:
+            with open(quant_path) as fh:
+                return f"q{int(json.load(fh)['bits'])}"
+        except (OSError, ValueError, KeyError, TypeError):
+            return "quantized"
+    return "bf16"
+
+
 def load_dit(
     model_dir: str | Path,
     dtype: mx.Dtype | None = None,

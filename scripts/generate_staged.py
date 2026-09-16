@@ -41,8 +41,13 @@ from minimax_h3_mlx.live_preview import (
     LivePreviewAborted,
     LivePreviewMonitor,
 )
-from minimax_h3_mlx.load import load_compact_audio_vae, load_compact_video_vae, load_dit
-from minimax_h3_mlx.media import save_mp4
+from minimax_h3_mlx.load import (
+    dit_precision,
+    load_compact_audio_vae,
+    load_compact_video_vae,
+    load_dit,
+)
+from minimax_h3_mlx.media import probe_video_frames, save_mp4
 from minimax_h3_mlx.packing import (
     AUDIO_CHANNELS,
     FPS,
@@ -279,6 +284,49 @@ def parse_chain_prompts(spec: str, windows: int) -> list[str]:
     return prompts
 
 
+ADALN_SKIP_PREFIX = "adaLN projection"
+
+
+def lora_accounting(data: dict, label: str, adaln_report: dict | None) -> dict:
+    """Every LoRA module pair, accounted for: wrapped, absorbed into the AdaLN cache, or lost.
+
+    ``apply_lora`` reports the adaLN pairs as skipped (the pruned DiT cannot wrap them);
+    ``absorb_adaln_lora`` then folds them in when ``--lora-adaln`` is given. Neither report alone
+    says whether anything was dropped, which is how Turbo v4 silently lost all 51 of its adaLN
+    pairs. ``unaccounted`` is the number that must be zero.
+    """
+    summaries = data.get(f"{label}lora_stack") or [data.get(f"{label}lora") or {}]
+    absorbed_by_path: dict[str, int] = {}
+    for report in (adaln_report or {}).get("stack") or ([adaln_report] if adaln_report else []):
+        count = int(report.get("blocks") or 0) + (1 if report.get("final") else 0)
+        key = str(report.get("path", ""))
+        absorbed_by_path[key] = absorbed_by_path.get(key, 0) + count
+    adapters = []
+    for summary in summaries:
+        by_reason = summary.get("skipped_by_reason") or {}
+        adaln_skipped = sum(n for r, n in by_reason.items() if r.startswith(ADALN_SKIP_PREFIX))
+        other_skipped = sum(n for r, n in by_reason.items() if not r.startswith(ADALN_SKIP_PREFIX))
+        path = str(summary.get("path", ""))
+        absorbed = absorbed_by_path.get(path)
+        if absorbed is None and len(summaries) == 1 and absorbed_by_path:
+            absorbed = sum(absorbed_by_path.values())
+        absorbed = min(int(absorbed or 0), adaln_skipped)
+        adapters.append({
+            "path": path,
+            "applied": summary.get("applied"),
+            "adaln_pairs": adaln_skipped,
+            "adaln_absorbed": absorbed,
+            "unaccounted": (adaln_skipped - absorbed) + other_skipped,
+        })
+    return {
+        "adapters": adapters,
+        "applied": sum(int(a["applied"] or 0) for a in adapters),
+        "adaln_pairs": sum(a["adaln_pairs"] for a in adapters),
+        "adaln_absorbed": sum(a["adaln_absorbed"] for a in adapters),
+        "unaccounted": sum(a["unaccounted"] for a in adapters),
+    }
+
+
 def stitch_windows(segments, sample_rate: int, crossfade_seconds: float):
     """Butt-join chained windows in pixel space and cross-fade their audio at every seam.
 
@@ -484,7 +532,11 @@ def render_window(
     # `lora_stack` is the ordered list of (path, scale); a single adapter is a
     # one-element list, so every consumer below handles one shape.
     lora_stack: list[tuple[Path, float]] = []
-    with record.phase(f"{label}dit_load_bf16"):
+    # The phase is named for what is really loaded (`dit_load_q8` for the quantized build), so a
+    # metrics file can no longer claim bf16 for a Q8 render.
+    precision = dit_precision(args.dit)
+    record.data[f"{label}dit_precision"] = precision
+    with record.phase(f"{label}dit_load_{precision}"):
         dit = load_dit(args.dit, verbose=True)
         patch = dit.config.patch_size
         lora_spec = getattr(args, "lora", None)
@@ -569,12 +621,16 @@ def render_window(
                     adaln_report = ModulationCache.current_lora_report()
                 else:
                     # Each adapter's adaLN delta adds into the same tables; the
-                    # report is the last one, with the whole stack listed.
+                    # whole stack is listed under "stack".
                     stack_reports = [
-                        lora_mod.absorb_adaln_lora(
+                        dict(lora_mod.absorb_adaln_lora(
                             dit, cache, lp, args.lora_adaln, ls, verbose=True
-                        ) for lp, ls in lora_stack]
-                    adaln_report = dict(stack_reports[-1])
+                        ), path=str(lp)) for lp, ls in lora_stack]
+                    # Headline the adapter that actually carried adaLN pairs (Turbo, normally
+                    # first), not whichever came last — a character LoRA stacked after Turbo has
+                    # none, and its empty report used to stand in for the whole stack.
+                    carriers = [r for r in stack_reports if r.get("blocks") or r.get("final")]
+                    adaln_report = dict((carriers or stack_reports)[0])
                     if len(stack_reports) > 1:
                         adaln_report["stack"] = stack_reports
                     if hasattr(ModulationCache, "remember_lora_report"):
@@ -584,6 +640,20 @@ def render_window(
             if draft_cache is not None:
                 draft_cache.store_adaln(adaln_key, cache, dit, adaln_report)
                 record.data[f"{label}adaln_cache_hit"] = False
+        if lora_stack and not getattr(args, "lora_already_applied", False):
+            accounting = lora_accounting(record.data, label, adaln_report)
+            record.data[f"{label}lora_accounting"] = accounting
+            record.flush()
+            print(
+                f"LoRA accounting: {accounting['applied']} wrapped, "
+                f"{accounting['adaln_absorbed']}/{accounting['adaln_pairs']} adaLN absorbed, "
+                f"{accounting['unaccounted']} unaccounted"
+                + ("" if accounting["unaccounted"] == 0 else
+                   " — WARNING: these adapter modules were NOT applied"
+                   + ("" if getattr(args, "lora_adaln", None) else
+                      " (pass --lora-adaln TIME_EMBEDDER for adaLN pairs)")),
+                flush=True,
+            )
         freed = drop_adaln_weights(dit)
         mx.clear_cache()
         print(f"AdaLN cache {cache.nbytes()/1024**2:.1f} MiB; dropped {gb(freed):.2f} GiB")
@@ -1453,10 +1523,9 @@ def main() -> int:
                 playback = float(FPS)
                 audio_tempo = source_frames / delivered_frames
                 audio_stretch_script = Path(__file__).with_name("time_stretch_audio.swift")
-                # AAC's frame boundary plus `-shortest` otherwise cuts a video frame when the
-                # exact stretched waveform ends a fraction of a millisecond before the nominal
-                # video boundary. Render 50 ms of the time-pitch unit's silent tail; ffmpeg trims
-                # it against the 124-frame video instead of trimming the video to 123 frames.
+                # Render 50 ms of the time-pitch unit's silent tail so the stretched waveform
+                # never ends short of the picture; save_mp4 cuts the audio at exactly
+                # frames / fps (it no longer relies on `-shortest`, which dropped a frame).
                 audio_output_frames = round((delivered_frames / FPS + 0.05) * sample_rate)
             save_mp4(
                 args.output,
@@ -1474,13 +1543,22 @@ def main() -> int:
 
                 save_frames(args.frames_dir, video)
                 print(f"wrote {len(video)} lossless frames to {args.frames_dir}", flush=True)
+            # What the FILE holds, not what the array held: a mux that drops a frame must show
+            # up here rather than be reported as a full delivery.
+            encoded_frames = probe_video_frames(args.output)
+            if encoded_frames is not None and encoded_frames != len(video):
+                print(f"WARNING: encoded {encoded_frames} frames, decoded {len(video)}",
+                      flush=True)
+            final_frames = encoded_frames if encoded_frames is not None else len(video)
 
         record.data.update(
             {
                 "status": "done",
                 "output": str(args.output),
-                "delivered_frames": int(len(video)),
-                "delivered_seconds": round(len(video) / FPS, 3),
+                "delivered_frames": int(final_frames),
+                "delivered_frames_source": "ffprobe" if encoded_frames is not None else "array",
+                "decoded_frames": int(len(video)),
+                "delivered_seconds": round(final_frames / playback, 3),
                 "total_seconds": round(time.perf_counter() - total_started, 3),
                 "mean_denoise_step_seconds": round(float(np.mean(step_times)), 3),
                 "denoise_step_seconds": [round(value, 3) for value in step_times],

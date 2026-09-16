@@ -80,7 +80,7 @@ from minimax_h3_mlx.load import (
     load_compact_video_vae as _real_load_video_vae,
 )
 from minimax_h3_mlx.load import load_dit as _real_load_dit  # noqa: E402
-from minimax_h3_mlx.media import save_mp4  # noqa: E402
+from minimax_h3_mlx.media import probe_video_frames, save_mp4  # noqa: E402
 from minimax_h3_mlx.packing import FPS, align_num_frames  # noqa: E402
 from minimax_h3_mlx.text_encoder import MiniMaxH3TextEncoder as _RealTextEncoder  # noqa: E402
 
@@ -457,6 +457,7 @@ def run_generate(engine, job_id, params: dict) -> dict:
             save_frames(Path(frames_dir), video)
             print(f"wrote {len(video)} lossless frames to {frames_dir}")
 
+    encoded_frames = probe_video_frames(output)
     total = time.perf_counter() - job_started
     # `Recorder.phase` resets the MLX peak counter on every phase entry, so `get_peak_memory()`
     # here would only report the mux. The job's real peak is the max over its phases -- the same
@@ -467,8 +468,9 @@ def run_generate(engine, job_id, params: dict) -> dict:
         {
             "status": "done",
             "output": str(output),
-            "delivered_frames": int(len(video)),
-            "delivered_seconds": round(len(video) / FPS, 3),
+            "delivered_frames": int(encoded_frames or len(video)),
+            "decoded_frames": int(len(video)),
+            "delivered_seconds": round((encoded_frames or len(video)) / FPS, 3),
             "total_seconds": round(total, 3),
             "mean_denoise_step_seconds": round(float(np.mean(step_times)), 3),
             "denoise_step_seconds": [round(v, 3) for v in step_times],

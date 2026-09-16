@@ -95,6 +95,7 @@ def save_mp4(
     ]
     if audio_path is not None:
         cmd += ["-i", str(audio_path)]
+        filters = []
         if audio_stretch_script is None and abs(audio_tempo - 1.0) > 1e-6:
             # atempo is only defined on [0.5, 100]; chain factors for anything slower.
             factors, remaining = [], float(audio_tempo)
@@ -102,14 +103,43 @@ def save_mp4(
                 factors.append(0.5)
                 remaining /= 0.5
             factors.append(remaining)
-            cmd += ["-filter:a", ",".join(f"atempo={f:.6f}" for f in factors)]
-        cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
-    cmd += ["-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p", str(path)]
+            filters += [f"atempo={f:.6f}" for f in factors]
+        # The picture decides the length, stated explicitly. `-shortest` used to do this and
+        # dropped the LAST video frame on every clip (73 -> 72, 124 -> 123): libx264 still holds
+        # frames in its lookahead when the audio stream ends, and the muxer stops there. Pad the
+        # audio with silence (a stretched or crossfaded waveform can end a few ms early) and cut
+        # it at exactly frames / fps, so both streams end on the picture's last frame.
+        filters += ["apad", f"atrim=duration={frames / float(fps):.6f}"]
+        cmd += ["-filter:a", ",".join(filters), "-c:a", "aac", "-b:a", "192k"]
+    cmd += [
+        "-frames:v", str(frames),
+        "-c:v", "libx264", "-crf", str(crf), "-pix_fmt", "yuv420p", str(path),
+    ]
 
     process = subprocess.run(cmd, input=video.tobytes(), capture_output=True)
     if process.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {process.stderr.decode()[:500]}")
     return path
+
+
+def probe_video_frames(path: str | Path) -> int | None:
+    """Frames in the first video stream of an ENCODED file, or ``None`` when unknown.
+
+    Counts packets rather than trusting container metadata, so it reports what a player will
+    actually show. ``None`` (no ffprobe, unreadable file) means "not verified", never zero.
+    """
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe is None:
+        return None
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "v:0", "-count_packets",
+             "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=60,
+        )
+        return int(result.stdout.strip().splitlines()[0].strip().rstrip(","))
+    except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+        return None
 
 
 def save_frames(directory: str | Path, video: np.ndarray, limit: int | None = None) -> Path:

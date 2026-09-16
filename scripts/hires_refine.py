@@ -42,9 +42,10 @@ from minimax_h3_mlx.config import PipelineConfig  # noqa: E402
 from minimax_h3_mlx.load import (  # noqa: E402
     load_compact_audio_vae,
     load_compact_video_vae,
+    dit_precision,
     load_dit,
 )
-from minimax_h3_mlx.media import save_mp4  # noqa: E402
+from minimax_h3_mlx.media import probe_video_frames, save_mp4  # noqa: E402
 from minimax_h3_mlx.packing import (  # noqa: E402
     AUDIO_CHANNELS,
     FPS,
@@ -290,7 +291,7 @@ def main() -> int:
             del keyframe_vae
             release()
 
-            with record.phase("refine_dit_load_bf16"):
+            with record.phase(f"refine_dit_load_{dit_precision(args.dit)}"):
                 dit = load_dit(args.dit, verbose=True)
                 patch = dit.config.patch_size
 
@@ -419,8 +420,10 @@ def main() -> int:
             {
                 "status": "done",
                 "output": str(args.output),
-                "delivered_frames": int(len(video)),
-                "delivered_seconds": round(len(video) / FPS, 3),
+                "delivered_frames": int(probe_video_frames(args.output) or len(video)),
+                "decoded_frames": int(len(video)),
+                "delivered_seconds": round(
+                    (probe_video_frames(args.output) or len(video)) / FPS, 3),
                 "total_seconds": round(time.perf_counter() - started_total, 3),
             }
         )
