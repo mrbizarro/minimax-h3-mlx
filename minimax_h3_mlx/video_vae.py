@@ -36,6 +36,15 @@ import mlx.nn as nn
 #: ``H3_VAE_BATCH=0`` (or 1) restores the one-call-per-tile loop.
 DEFAULT_DECODE_BATCH = 8
 
+#: Arithmetic dtype of the ViT decoder. The compact checkpoint stores FP16 weights, but the runner
+#: hands the decoder FLOAT32 latents, and MLX promotes ``fp16 weight x fp32 input`` to float32 — so
+#: until now every decoder linear, attention and FFN ran in float32 (with a per-call weight upcast).
+#: The PyTorch reference decodes under FP16 autocast and ComfyUI runs the VAE in fp16, so
+#: ``float16`` is the reference-equivalent precision; the RMS/QK norms stay float32 either way and
+#: tiles are cast back to float32 before stitching. ``H3_VAE_DTYPE`` overrides the default.
+DEFAULT_DECODE_DTYPE = "float32"
+DECODE_DTYPES = {"float32": mx.float32, "float16": mx.float16, "bfloat16": mx.bfloat16}
+
 
 def resolved_decode_batch() -> int:
     """The decode batch a freshly built :class:`VideoVAE` will use, honouring ``H3_VAE_BATCH``.
@@ -50,6 +59,12 @@ def resolved_decode_batch() -> int:
         return max(int(raw), 0)
     except ValueError:
         return DEFAULT_DECODE_BATCH
+
+
+def resolved_decode_dtype() -> str:
+    """The decoder compute dtype a fresh :class:`VideoVAE` will use (``H3_VAE_DTYPE`` or default)."""
+    raw = (os.environ.get("H3_VAE_DTYPE") or DEFAULT_DECODE_DTYPE).strip().lower()
+    return raw if raw in DECODE_DTYPES else DEFAULT_DECODE_DTYPE
 
 
 @dataclass
@@ -452,7 +467,9 @@ class ViTDecoder3d(nn.Module):
         for block in self.transformer_blocks:
             tokens = block(tokens, rotary)
 
-        tokens = self.proj_out(self.norm_out(tokens))[:, :num_patches, :]
+        # Final LayerNorm in float32, as the reference's autocast does; a no-op at float32.
+        normed = self.norm_out(tokens.astype(mx.float32)).astype(tokens.dtype)
+        tokens = self.proj_out(normed)[:, :num_patches, :]
 
         p, pt = self.patch_size, self.patch_size_t
         out = tokens.reshape(b, d, h, w, self.out_channels, pt, p, p)
@@ -487,6 +504,7 @@ class VideoVAE(nn.Module):
         self.tile_sample_min_overlap_height = 64
         self.tile_sample_min_overlap_width = 64
         self.decode_batch = resolved_decode_batch()
+        self.decode_dtype = resolved_decode_dtype()
 
     # -- tiling -----------------------------------------------------------------------------
 
@@ -578,7 +596,7 @@ class VideoVAE(nn.Module):
         depends on its ``(d, h, w)``, so only same-shaped tiles may share a call.
         """
         if self.decode_batch <= 1 or len(tiles) < 2:
-            return [self.decoder(self.post_quant_conv(tile)) for tile in tiles]
+            return [self._run_decoder(tile) for tile in tiles]
 
         groups: dict[tuple[int, ...], list[int]] = {}
         for index, tile in enumerate(tiles):
@@ -589,10 +607,10 @@ class VideoVAE(nn.Module):
             for start in range(0, len(members), self.decode_batch):
                 part = members[start : start + self.decode_batch]
                 if len(part) == 1:
-                    out[part[0]] = self.decoder(self.post_quant_conv(tiles[part[0]]))
+                    out[part[0]] = self._run_decoder(tiles[part[0]])
                     continue
                 stacked = mx.concatenate([tiles[index] for index in part], axis=0)
-                decoded = self.decoder(self.post_quant_conv(stacked))
+                decoded = self._run_decoder(stacked)
                 cursor = 0
                 for index in part:
                     size = tiles[index].shape[0]
@@ -600,9 +618,21 @@ class VideoVAE(nn.Module):
                     cursor += size
         return out
 
+    def _run_decoder(self, z: mx.array) -> mx.array:
+        """``post_quant_conv`` + ViT decoder at :attr:`decode_dtype`, returned in the input dtype.
+
+        With the default float32 this is exactly the historical call (the 1x1 conv and every
+        linear promote to float32 anyway), so existing renders are bit-for-bit unchanged.
+        """
+        compute = DECODE_DTYPES[self.decode_dtype]
+        h = self.post_quant_conv(z)
+        if h.dtype == compute:
+            return self.decoder(h)
+        return self.decoder(h.astype(compute)).astype(z.dtype)
+
     def _decode_clip(self, z: mx.array) -> mx.array:
         if not self.use_tiling:
-            return self.decoder(self.post_quant_conv(z))
+            return self._run_decoder(z)
         ratio = self.config.spatial_compression_ratio
         h, w = z.shape[2] * ratio, z.shape[3] * ratio
         y_idx, y_len, y_ov = self._split_tiles(h, self.tile_sample_min_height, self.tile_sample_min_overlap_height)

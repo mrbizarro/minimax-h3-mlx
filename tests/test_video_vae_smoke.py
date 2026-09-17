@@ -110,6 +110,31 @@ def main() -> int:
 
         model.decode_batch = DEFAULT_DECODE_BATCH
 
+    # Decoder precision. The shipped checkpoint stores FP16 weights and the runner passes float32
+    # latents, so the historical decode ran float32 arithmetic. `decode_dtype="float32"` must stay
+    # that exact call; float16 must stay close and still hand back float32 pixels.
+    model.set_dtype(mx.float16)
+    model.tile_sample_min_height = model.tile_sample_min_width = 64
+    model.tile_sample_min_overlap_height = model.tile_sample_min_overlap_width = 16
+    latent = mx.random.normal((1, config.latent_channels, latent_frames, 96 // ratio, 160 // ratio))
+    model.decode_batch = 0
+    model.decode_dtype = "float32"
+    tile = latent.transpose(0, 2, 3, 4, 1)[:, :, :4, :4, :]
+    historical = model.decoder(model.post_quant_conv(tile))
+    current = model._run_decoder(tile)
+    check("float32 decode_dtype is the historical call",
+          historical.dtype == mx.float32 and bool(mx.array_equal(historical, current).item()),
+          f"historical dtype {historical.dtype}")
+    ref = model.decode(latent)
+    model.decode_dtype = "float16"
+    half = model.decode(latent)
+    mx.eval(ref, half)
+    rel = (mx.abs(half - ref).max() / (mx.abs(ref).max() + 1e-6)).item()
+    check("float16 decode returns float32 and stays close", half.dtype == mx.float32 and rel < 1e-2,
+          f"max rel diff {rel:.2e}")
+    model.decode_dtype = "float32"
+    model.decode_batch = DEFAULT_DECODE_BATCH
+
     print()
     if FAILURES:
         print(f"FAILED ({len(FAILURES)}): {FAILURES}")

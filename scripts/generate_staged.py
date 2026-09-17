@@ -67,7 +67,7 @@ from minimax_h3_mlx.pipeline import encode_keyframe_rows
 from minimax_h3_mlx.scheduler import MiniMaxH3Scheduler
 from minimax_h3_mlx.stepcache import StepResidualCache
 from minimax_h3_mlx.text_encoder import MiniMaxH3TextEncoder
-from minimax_h3_mlx.video_vae import resolved_decode_batch
+from minimax_h3_mlx.video_vae import resolved_decode_batch, resolved_decode_dtype
 
 
 def gb(value: int) -> float:
@@ -114,11 +114,37 @@ class Recorder:
             )
 
 
-def build_schedules(points: int, config: PipelineConfig):
+def parse_sigma_subset(spec: str | None) -> tuple[int, tuple[int, ...]] | None:
+    """``"50:0,16,33,49"`` -> ``(50, (0, 16, 33, 49))``: keep those points of an N-point grid.
+
+    This is how step-distilled adapters that were trained on a sub-sampled schedule publish their
+    ladder (TaoMate-H3: ``DISTILLED_STATE_INDICES = (0, 16, 33, 49)`` of the shifted 50-point grid,
+    3 forwards). The indices must start at 0, end at N-1 and increase strictly.
+    """
+    if not spec:
+        return None
+    grid, _, tail = str(spec).partition(":")
+    n = int(grid)
+    indices = tuple(int(v) for v in tail.split(",") if v.strip())
+    if len(indices) < 2 or indices[0] != 0 or indices[-1] != n - 1 or list(indices) != sorted(set(indices)):
+        raise ValueError(f"--sigma-subset {spec!r}: indices must be sorted, unique, and span 0..{n - 1}")
+    return n, indices
+
+
+def build_schedules(points: int, config: PipelineConfig, subset=None):
     video = MiniMaxH3Scheduler(shift=config.sigma_shift_video)
     audio = MiniMaxH3Scheduler(shift=config.sigma_shift_audio)
-    video.set_timesteps(points)
-    audio.set_timesteps(points)
+    if subset is None:
+        video.set_timesteps(points)
+        audio.set_timesteps(points)
+        return video, audio
+    grid, indices = subset
+    for sched in (video, audio):
+        sched.set_timesteps(grid)
+        full = sched.sigmas.tolist()
+        if len(full) != grid:
+            raise ValueError(f"the {grid}-point grid collapsed to {len(full)} points at this shift")
+        sched.set_timesteps(sigmas=[full[i] for i in indices])
     return video, audio
 
 
@@ -588,7 +614,14 @@ def render_window(
     record.flush()
 
     with record.phase(f"{label}adaln_cache_and_noise"):
-        video_sched, audio_sched = build_schedules(args.steps, config)
+        video_sched, audio_sched = build_schedules(args.steps, config, parse_sigma_subset(args.sigma_subset))
+        record.data[f"{label}schedule"] = {
+            "sigma_subset": args.sigma_subset,
+            "video_sigmas": [round(float(v), 7) for v in video_sched.sigmas.tolist()],
+            "audio_sigmas": [round(float(v), 7) for v in audio_sched.sigmas.tolist()],
+        }
+        print(f"schedule: video sigmas {[round(float(v), 4) for v in video_sched.sigmas.tolist()]}, "
+              f"audio sigmas {[round(float(v), 4) for v in audio_sched.sigmas.tolist()]}", flush=True)
         timestep_table, plan = row_timestep_plan(
             layout, video_sched.timesteps, audio_sched.timesteps
         )
@@ -1105,6 +1138,20 @@ def main() -> int:
         action="store_true",
         help="Record |lora_out|/|base_out| on the first forward, per wrapped layer.",
     )
+    parser.add_argument(
+        "--sigma-subset",
+        default=None,
+        metavar="N:I0,I1,...",
+        help="Use only these points of the shifted N-point sigma grid (e.g. 50:0,16,33,49 for "
+        "TaoMate-H3's 3-forward ladder). --steps must equal the number of indices.",
+    )
+    parser.add_argument(
+        "--vae-dtype",
+        choices=("float32", "float16", "bfloat16"),
+        default=None,
+        help="ViT decoder arithmetic dtype (default float32, or H3_VAE_DTYPE). float16 matches the "
+        "reference's FP16 autocast and ComfyUI's fp16 VAE.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--wired-gb", type=float, default=50.0)
     parser.add_argument("--memory-gb", type=float, default=58.0)
@@ -1201,6 +1248,15 @@ def main() -> int:
         parser.error("--height and --width must be multiples of 32")
     if args.steps < 2:
         parser.error("--steps must be at least 2")
+    try:
+        subset = parse_sigma_subset(args.sigma_subset)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if subset is not None and len(subset[1]) != args.steps:
+        parser.error(f"--sigma-subset keeps {len(subset[1])} points; pass --steps {len(subset[1])}")
+    if args.vae_dtype:
+        import os
+        os.environ["H3_VAE_DTYPE"] = args.vae_dtype
     if args.draft_decode == "tae" and args.tae_checkpoint is None:
         parser.error("--draft-decode tae requires --tae-checkpoint")
     if args.draft_decode == "tae" and not args.tae_checkpoint.is_file():
@@ -1374,6 +1430,7 @@ def main() -> int:
         "chain_audio_crossfade": args.chain_audio_crossfade if chain > 1 else None,
         # Which video-VAE decode mode produced this run, so a metrics file is self-describing
         # when someone compares decode phases across the campaign. 0/1 is the per-tile loop.
+        "vae_decode_dtype": resolved_decode_dtype(),
         "vae_decode_batch": resolved_decode_batch(),
         "wired_gb": round(gb(wired_bytes), 3),
         "memory_limit_gb": round(gb(memory_bytes), 3),
