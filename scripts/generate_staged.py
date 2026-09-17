@@ -64,6 +64,12 @@ from minimax_h3_mlx.packing import (
     video_latent_num_frames,
 )
 from minimax_h3_mlx.pipeline import encode_keyframe_rows
+from minimax_h3_mlx.render_guard import (
+    RenderIntegrityError,
+    check_decoded_video,
+    nonfinite_error,
+    nonfinite_flag,
+)
 from minimax_h3_mlx.scheduler import MiniMaxH3Scheduler
 from minimax_h3_mlx.stepcache import StepResidualCache
 from minimax_h3_mlx.text_encoder import MiniMaxH3TextEncoder
@@ -820,7 +826,13 @@ def render_window(
                 if n_cond_v
                 else stepped_video
             )
-            mx.eval(video_rows, audio_rows)
+            # One scalar rides the same eval: a NaN/inf latent (an overflowing adapter, 2026-09-17)
+            # stops the render at the step it appears instead of decoding to a black "success".
+            broken = nonfinite_flag(video_rows, audio_rows)
+            mx.eval(video_rows, audio_rows, broken)
+            if broken.item():
+                raise nonfinite_error(
+                    f"after denoise step {index + 1}/{num_forwards}", lora_stack)
             elapsed = time.perf_counter() - started
             step_times.append(elapsed)
             print(
@@ -935,6 +947,7 @@ def render_window(
             )
         del video_vae, video_rows
     release()
+    check_decoded_video(video, lora_stack)
 
     with record.phase(f"{label}audio_vae_decode"):
         audio_vae = load_compact_audio_vae(args.compact_root / "audio_vae.safetensors")
@@ -1644,6 +1657,11 @@ def main() -> int:
         print(f"\nABORTED: {exc}", flush=True)
         return ABORT_EXIT_CODE
     except BaseException as exc:
+        if isinstance(exc, RenderIntegrityError):
+            # Readable by the panel as-is: it shows `error_message`, not a traceback tail.
+            record.data["error_kind"] = exc.kind
+            record.data["error_message"] = str(exc)
+            print(f"\nERROR: {exc}", flush=True)
         record.data.update(
             {
                 "status": "error",

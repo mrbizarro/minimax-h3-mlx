@@ -190,6 +190,20 @@ def _iter_targets(model) -> dict[str, tuple[nn.Module, str]]:
     return targets
 
 
+# Adapter dtypes whose RANGE covers a bfloat16 activation. float16 does not: its max is 65504,
+# while the DiT's MLP inputs (the SwiGLU product fc2 reads) routinely exceed that. An F16 file
+# (ai-toolkit and kohya both save them) computed in its stored dtype turned `x.astype(float16)`
+# into inf, the delta into inf/NaN, and the whole render into a flat black clip that still
+# reported success (2026-09-17). Anything not listed is promoted to bfloat16 — the activation
+# dtype, so the adapter costs exactly what a BF16 file costs.
+RUNTIME_SAFE_DTYPES = (mx.bfloat16, mx.float32)
+
+
+def runtime_adapter_dtype(t: mx.array) -> mx.array:
+    """``t`` in a dtype the runtime delta can be computed in without overflowing."""
+    return t if t.dtype in RUNTIME_SAFE_DTYPES else t.astype(mx.bfloat16)
+
+
 class LoRALinear(nn.Module):
     """``y = base(x) + scale * (x @ A^T) @ B^T``, the update kept out of the base weight.
 
@@ -206,8 +220,8 @@ class LoRALinear(nn.Module):
         # quantization metadata (`scales`) from `plan()`, which then compares
         # the adapter against PACKED uint32 storage and skips every module —
         # the applied=0 failure documented in `plan`.
-        self.lora_a = [a]
-        self.lora_b = [b]
+        self.lora_a = [runtime_adapter_dtype(a)]
+        self.lora_b = [runtime_adapter_dtype(b)]
         self.lora_scales = [float(scale)]
         self._audit_ratio: float | None = None
 
@@ -221,8 +235,8 @@ class LoRALinear(nn.Module):
 
     def add(self, a: mx.array, b: mx.array, scale: float) -> None:
         """Stack another adapter on the same base layer."""
-        self.lora_a.append(a)
-        self.lora_b.append(b)
+        self.lora_a.append(runtime_adapter_dtype(a))
+        self.lora_b.append(runtime_adapter_dtype(b))
         self.lora_scales.append(float(scale))
 
     @property
@@ -235,7 +249,8 @@ class LoRALinear(nn.Module):
         for a, b, scale in zip(self.lora_a, self.lora_b, self.lora_scales):
             if scale == 0.0:
                 continue
-            part = (x.astype(a.dtype) @ a.T) @ b.T
+            # The stored dtype is range-safe by construction (`runtime_adapter_dtype`).
+            part = (x.astype(a.dtype) @ a.T) @ b.T.astype(a.dtype)
             if scale != 1.0:
                 part = part * scale
             delta = part if delta is None else delta + part.astype(delta.dtype)
