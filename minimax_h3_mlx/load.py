@@ -52,7 +52,10 @@ def shard_paths(model_dir: str | Path) -> list[Path]:
             weight_map = json.load(fh)["weight_map"]
         names = sorted(set(weight_map.values()))
         return [model_dir / name for name in names]
-    shards = sorted(model_dir.glob("*.safetensors"))
+    # Dot-prefixed files are never shards: on an exFAT/SMB volume macOS keeps
+    # an AppleDouble twin (`._model-00001.safetensors`) beside every file, and
+    # pathlib's glob matches it.
+    shards = sorted(p for p in model_dir.glob("*.safetensors") if not p.name.startswith("."))
     if not shards:
         raise FileNotFoundError(f"No safetensors found in {model_dir}.")
     return shards

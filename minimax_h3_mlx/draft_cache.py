@@ -256,9 +256,17 @@ class DraftCache:
     def _prune_unreferenced_text(self) -> None:
         requests = []
         for path in (self.root / "text_requests").glob("*.json"):
+            # macOS writes an AppleDouble twin (`._name.json`) next to every
+            # file on an exFAT/SMB volume, and pathlib's glob matches it. It is
+            # binary, so reading it as text raised UnicodeDecodeError — a
+            # ValueError, not a JSONDecodeError — and the render died in the
+            # cache bookkeeping. Skip the twins, and never let a byte in a
+            # cache file end a render.
+            if path.name.startswith("."):
+                continue
             try:
-                requests.append(json.loads(path.read_text())["text_embed_sha256"])
-            except (OSError, KeyError, json.JSONDecodeError):
+                requests.append(json.loads(path.read_text(encoding="utf-8"))["text_embed_sha256"])
+            except (OSError, KeyError, ValueError):
                 path.unlink(missing_ok=True)
         referenced = set(requests)
         for entry in (self.root / "text").glob("*.npz"):
