@@ -211,7 +211,8 @@ class LoRALinear(nn.Module):
     rounds it away (see the module docstring). Cost is ~1.5 % of the linear's FLOPs at rank 64.
     """
 
-    def __init__(self, base: nn.Module, a: mx.array, b: mx.array, scale: float):
+    def __init__(self, base: nn.Module, a: mx.array, b: mx.array, scale: float,
+                 source: str | None = None):
         super().__init__()
         self.base = base
         # One wrapper, N adapters. Stacking is a sum of independent low-rank
@@ -223,6 +224,9 @@ class LoRALinear(nn.Module):
         self.lora_a = [runtime_adapter_dtype(a)]
         self.lora_b = [runtime_adapter_dtype(b)]
         self.lora_scales = [float(scale)]
+        # Which file each stacked adapter came from, in the same order: lets one adapter be
+        # switched off mid-run (re-voice drops the speed adapter, keeps a character LoRA).
+        self.lora_sources = [source]
         self._audit_ratio: float | None = None
 
     @property
@@ -233,11 +237,12 @@ class LoRALinear(nn.Module):
     def adapters(self) -> int:
         return len(self.lora_a)
 
-    def add(self, a: mx.array, b: mx.array, scale: float) -> None:
+    def add(self, a: mx.array, b: mx.array, scale: float, source: str | None = None) -> None:
         """Stack another adapter on the same base layer."""
         self.lora_a.append(runtime_adapter_dtype(a))
         self.lora_b.append(runtime_adapter_dtype(b))
         self.lora_scales.append(float(scale))
+        self.lora_sources.append(source)
 
     @property
     def weight(self) -> mx.array:          # keeps `param_dtype()` working through the wrapper
@@ -372,9 +377,9 @@ def apply_lora(
             report.permuted_qkv += 1
         if mode == "runtime":
             if isinstance(base, LoRALinear):
-                base.add(a, b, scale)
+                base.add(a, b, scale, source=str(path))
             else:
-                setattr(parent, attr, LoRALinear(base, a, b, scale))
+                setattr(parent, attr, LoRALinear(base, a, b, scale, source=str(path)))
         elif isinstance(base, LoRALinear):
             skipped.append(ModuleReport(
                 name, "skipped",

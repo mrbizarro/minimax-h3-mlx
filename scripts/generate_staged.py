@@ -90,6 +90,12 @@ from minimax_h3_mlx.text_encoder import MiniMaxH3TextEncoder
 from minimax_h3_mlx.video_vae import resolved_decode_batch, resolved_decode_dtype
 
 
+def parse_lora_path(spec) -> Path:
+    from minimax_h3_mlx import lora as lora_mod
+
+    return Path(lora_mod.parse_spec(str(spec))[0])
+
+
 def gb(value: int) -> float:
     return value / 1024**3
 
@@ -709,6 +715,7 @@ class WindowConditioning:
     history_audio: np.ndarray | None = None
     drive_audio: np.ndarray | None = None
     frozen_frames: np.ndarray | None = None
+    references: list = field(default_factory=list)
 
     @property
     def decode_video(self) -> bool:
@@ -725,10 +732,134 @@ class WindowConditioning:
             "drive_audio_seconds": (
                 None if self.drive_audio is None else round(self.drive_audio.shape[1] / 32000.0, 4)
             ),
+            "references": len(self.references),
             "frozen_video_frames": (
                 None if self.frozen_frames is None else int(len(self.frozen_frames))
             ),
         }
+
+
+def shift_reference_labels(prompt: str, base_keyframes: int, keyframes: int) -> str:
+    """Move "<Picture n>" labels that name references (n > base_keyframes) to this window's
+    numbering, where the references come after `keyframes` keyframes."""
+    import re
+
+    delta = int(keyframes) - int(base_keyframes)
+    if not delta:
+        return prompt
+
+    def move(match):
+        n = int(match.group(1))
+        return f"<Picture {n + delta}>" if n > base_keyframes else match.group(0)
+
+    return re.sub(r"<Picture (\d+)>", move, prompt)
+
+
+def revoice_wanted(args, cond, lora_stack) -> bool:
+    """Re-voice runs on a window whose sound the model makes with an adapter switched on.
+
+    Skipped where it has nothing to do: no adapter to switch off, a held soundtrack (lip-sync),
+    or a held picture (Add sound already makes the sound with no speed adapter).
+    """
+    if int(getattr(args, "revoice_steps", 0) or 0) <= 0:
+        return False
+    if not lora_stack or getattr(args, "lora_already_applied", False):
+        return False
+    return cond.drive_audio is None and cond.frozen_frames is None
+
+
+def write_wav(path: Path, audio: np.ndarray, rate: int) -> None:
+    import wave
+
+    pcm = (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2")
+    with wave.open(str(path), "wb") as fh:
+        fh.setnchannels(int(audio.shape[0]))
+        fh.setsampwidth(2)
+        fh.setframerate(rate)
+        fh.writeframes(pcm.T.copy().tobytes())
+
+
+def run_revoice(args, record, label, dit, rv, layout, video_rows, audio_rows, embeds, seed,
+                n_cond_a, lora_stack):
+    """Re-make this window's sound with the speed adapter off; the picture rows never move.
+
+    Returns the new audio rows (conditioning rows first, untouched).
+    """
+    mod = rv["mod"]
+    kv = getattr(args, "revoice_kv", "int8")
+    started = time.perf_counter()
+    with record.phase(f"{label}revoice"):
+        switched = mod.set_adapter_scales(dit, rv["drop"], 0.0)
+        print(
+            f"re-voice: {rv['forwards']} audio steps with {', '.join(p.name for p in rv['drop'])} "
+            f"off ({switched['entries']} adapter entries), KV {kv}",
+            flush=True,
+        )
+        target_shape = (audio_rows.shape[0] - n_cond_a, audio_rows.shape[1])
+        # Its own noise: the adapter's audio is not a starting point, the base model starts over.
+        key = mx.random.key(int(seed) * 7919 + 104729)
+        noise = mx.random.normal(target_shape, key=key).astype(mx.float32)
+        strength = float(rv.get("strength", 1.0))
+        if strength < 1.0:
+            # x_t = t * x0 + (1 - t) * noise at sigma = strength (t = 1 - strength).
+            noise = (1.0 - strength) * audio_rows[n_cond_a:].astype(mx.float32) + strength * noise
+        cond_audio = audio_rows[:n_cond_a] if n_cond_a else None
+        rows = mx.concatenate([cond_audio, noise]) if n_cond_a else noise
+        rotary = None
+        store = None
+        step_seconds = []
+        for index, timestep in enumerate(rv["audio_sched"].timesteps.tolist()):
+            t0 = time.perf_counter()
+            forward_args = (
+                video_rows[None].astype(mx.bfloat16),
+                rows[None].astype(mx.bfloat16),
+                embeds.astype(mx.bfloat16),
+                rv["table"],
+                rv["plan"][index],
+                layout.token_tags,
+                layout.position_ids,
+                layout.video_indices,
+                layout.audio_indices,
+                layout.text_indices,
+            )
+            if kv == "off":
+                _, audio_out = dit(*forward_args, modulation_cache=rv["cache"])
+                pred = audio_out[0].astype(mx.float32)
+            elif store is None:
+                audio_out, store = mod.store_forward(dit, forward_args, rv["cache"], rv["rows"], kv)
+                pred = audio_out[0].astype(mx.float32)
+                rotary = dit.rope(layout.position_ids)
+            else:
+                pred = mod.audio_forward(
+                    dit, rows, rv["table"], rv["plan"][index], layout, rv["rows"], store,
+                    rv["cache"], rotary,
+                ).astype(mx.float32)
+            stepped = rv["audio_sched"].step(pred[n_cond_a:], float(timestep), rows[n_cond_a:])
+            rows = mx.concatenate([cond_audio, stepped]) if n_cond_a else stepped
+            broken = nonfinite_flag(video_rows, rows)
+            mx.eval(rows, broken)
+            if broken.item():
+                raise nonfinite_error(f"after re-voice step {index + 1}/{rv['forwards']}", lora_stack)
+            step_seconds.append(time.perf_counter() - t0)
+            print(f"re-voice step {index + 1}/{rv['forwards']}: {step_seconds[-1]:.2f}s "
+                  f"(active {gb(mx.get_active_memory()):.1f} GiB)", flush=True)
+        mod.set_adapter_scales(dit, rv["drop"], None)
+        record.data[f"{label}revoice"] = {
+            "steps": int(rv["forwards"]) + 1,
+            "forwards": int(rv["forwards"]),
+            "kv": kv,
+            "strength": strength,
+            "kv_gib": round(gb(store.nbytes), 3) if store is not None else 0.0,
+            "dynamic_rows": int(rv["rows"].dynamic.shape[0]),
+            "cached_rows": int(rv["rows"].cached.shape[0]),
+            "dropped": [str(p) for p in rv["drop"]],
+            "adapter_entries_off": int(switched["entries"]),
+            "step_seconds": [round(v, 3) for v in step_seconds],
+            "seconds": round(time.perf_counter() - started, 3),
+        }
+        record.flush()
+        del store
+    return rows
 
 
 def render_window(
@@ -757,6 +888,9 @@ def render_window(
         cond = WindowConditioning(keyframes=[(keyframe, "first")] if keyframe is not None else [])
     keyframes = [image for image, _ in cond.keyframes] or None
     keyframe_anchors = tuple(anchor for _, anchor in cond.keyframes)
+    # The vision tower sees the keyframes first (their "<Picture n>" numbering is what the
+    # alignment line names), then the reference images, labelled after them.
+    vision_images = (keyframes or []) + list(cond.references)
     if keyframe is None and keyframes:
         # The draft cache keys on "the" first frame; it is only ever used with a plain first-frame
         # window (media_mode_errors refuses it with anything richer).
@@ -809,11 +943,11 @@ def render_window(
             encoder = MiniMaxH3TextEncoder(
                 args.compact_root,
                 dtype=mx.bfloat16,
-                load_vision=keyframes is not None,
+                load_vision=bool(vision_images),
                 verbose=True,
                 config_path=args.text_config,
             )
-            embeds, text_tags = encoder.encode(prompt, keyframes)
+            embeds, text_tags = encoder.encode(prompt, vision_images or None)
             embeds = mx.array(embeds)
             mx.eval(embeds)
             if prompt_cache is not None:
@@ -893,6 +1027,24 @@ def render_window(
                         keyframe_key, np.array(condition_rows.astype(mx.float32))
                     )
                     record.data[f"{label}keyframe_cache_hit"] = False
+        release()
+
+    reference_rows = None
+    reference_grids: tuple = ()
+    if cond.references:
+        with record.phase(f"{label}reference_encode"):
+            ref_vae = load_compact_video_vae(args.compact_root / "video_vae.safetensors")
+            parts, grids = [], []
+            for image in cond.references:
+                w_ref, h_ref = image.size
+                parts.append(encode_keyframe_rows(ref_vae, [image], h_ref, w_ref, patch))
+                grids.append((h_ref // 16, w_ref // 16))
+            reference_rows = mx.concatenate(parts) if len(parts) > 1 else parts[0]
+            reference_grids = tuple(grids)
+            mx.eval(reference_rows)
+            print(f"reference images: {len(parts)} at {[g for g in grids]} latent, "
+                  f"{reference_rows.shape[0]} rows", flush=True)
+        del ref_vae
         release()
 
     # Media conditioning: carried history and/or a frozen picture, encoded while only the video VAE
@@ -1008,6 +1160,7 @@ def render_window(
         history_latent_frames=history_latent_frames,
         history_audio_latents=history_audio_latents,
         history_audio_offset=history_audio_offset,
+        reference_grids=reference_grids,
     )
     n_target_video = int(layout.video_indices.shape[0]) - layout.num_condition_video_rows
     n_target_audio = int(layout.audio_indices.shape[0]) - layout.num_condition_audio_rows
@@ -1110,6 +1263,45 @@ def render_window(
                       " (pass --lora-adaln TIME_EMBEDDER for adaLN pairs)")),
                 flush=True,
             )
+        revoice = None
+        if revoice_wanted(args, cond, lora_stack):
+            # Built here because the per-block adaLN projections are dropped just below: the
+            # re-voice pass runs its own (audio-only) schedule, so it needs its own table.
+            from minimax_h3_mlx import revoice as revoice_mod
+
+            rv_video, rv_audio = build_schedules(args.revoice_steps, config)
+            strength = float(getattr(args, "revoice_strength", 1.0) or 1.0)
+            if strength < 1.0:
+                # Start part-way down the audio schedule from the adapter's own sound, noised to
+                # `strength`: the timing (what the lips do) is kept, the timbre is re-made.
+                rv_audio.set_timesteps(sigmas=revoice_mod.start_sigmas(
+                    [float(v) for v in rv_audio.sigmas.tolist()], strength))
+            rv_forwards = len(rv_audio.timesteps)
+            # The picture is held clean (t = 1), keyframe rows stay at their augmentation level,
+            # and the text rows sit at t = 0 for every step - the level they see on step 0 of any
+            # render - so nothing but the target audio rows changes across the pass and the
+            # stored keys/values stay exact for every non-audio row.
+            rv_table, rv_plan = row_timestep_plan(
+                layout,
+                mx.zeros((rv_forwards,), dtype=mx.float32),
+                rv_audio.timesteps,
+                np.ones(n_target_video, dtype=bool),
+                None,
+            )
+            rv_cache = ModulationCache.build(dit, rv_table, dtype=mx.bfloat16)
+            mx.eval(rv_cache.tables)
+            drop = [Path(p) for p in (args.revoice_drop or [])] or ([lora_stack[0][0]] if lora_stack else [])
+            revoice = {
+                "mod": revoice_mod,
+                "audio_sched": rv_audio,
+                "table": rv_table,
+                "plan": rv_plan,
+                "cache": rv_cache,
+                "forwards": rv_forwards,
+                "drop": drop,
+                "rows": revoice_mod.plan_rows(layout),
+                "strength": strength,
+            }
         skip_spec = getattr(args, "skip_blocks", None)
         if skip_spec:
             skipped_blocks = resolve_skip_blocks(skip_spec, cache, dit.config.num_layers)
@@ -1168,6 +1360,18 @@ def render_window(
             condition_rows = MiniMaxH3Scheduler(
                 shift=config.sigma_shift_video
             ).scale_noise(condition_rows, KEYFRAME_NOISE_AUG, condition_noise)
+        noised_refs = None
+        if reference_rows is not None:
+            # Their own draw, so a seed renders the same base noise with or without references.
+            ref_noise = mx.random.normal(
+                reference_rows.shape, key=mx.random.key(int(seed) * 131 + 17)
+            ).astype(mx.float32)
+            noised_refs = MiniMaxH3Scheduler(shift=config.sigma_shift_video).scale_noise(
+                reference_rows, KEYFRAME_NOISE_AUG, ref_noise)
+            condition_rows = (
+                noised_refs if condition_rows is None
+                else mx.concatenate([noised_refs, condition_rows])
+            )
         video_rows = patchify_video_latents(latents, patch)
         frozen_video_values = None
         if frozen_video_rows is not None:
@@ -1332,6 +1536,17 @@ def render_window(
         record.data[f"{label}step_cache"] = step_cache.summary()
         print(f"step cache: reused {step_cache.skipped}/{num_forwards} forwards")
 
+    adapter_audio_rows = None
+    if revoice is not None:
+        mx.eval(video_rows, audio_rows)
+        if getattr(args, "revoice_keep_original", False):
+            adapter_audio_rows = audio_rows
+        audio_rows = run_revoice(
+            args, record, label, dit, revoice, layout, video_rows, audio_rows, embeds, seed,
+            n_cond_a, lora_stack,
+        )
+        del revoice
+
     mx.eval(video_rows, audio_rows)
     stage_a_cache = getattr(args, "save_stage_a", None)
     if stage_a_cache is not None:
@@ -1406,7 +1621,14 @@ def render_window(
         audio_vae = load_compact_audio_vae(args.compact_root / "audio_vae.safetensors")
         audio = decode_audio(audio_vae, audio_rows[n_cond_a:], audio_latents, frames)
         sample_rate = audio_vae.config.sampling_rate
-    del audio_vae, audio_rows, embeds, layout
+        if adapter_audio_rows is not None:
+            original = decode_audio(audio_vae, adapter_audio_rows[n_cond_a:], audio_latents, frames)
+            keep = args.output.with_name(f"{args.output.stem}_{label}adapter_audio.wav")
+            keep.parent.mkdir(parents=True, exist_ok=True)
+            write_wav(keep, original, int(sample_rate))
+            record.data[f"{label}revoice"]["adapter_audio"] = str(keep)
+            del original
+    del audio_vae, audio_rows, embeds, layout, adapter_audio_rows
     release()
 
     record.data[f"{label}mean_denoise_step_seconds"] = round(float(np.mean(step_times)), 3)
@@ -1619,6 +1841,65 @@ def main() -> int:
         help="EXPERIMENTAL speed lever: skip DiT blocks — 'auto:N' skips the N with the smallest "
         "residual gates, or list them ('12,23,31'). Blocks 0, 1 and 49 are never skipped.",
     )
+    parser.add_argument(
+        "--reference",
+        type=Path,
+        action="append",
+        default=None,
+        metavar="IMAGE",
+        help="A reference image (a character's face or sheet): packed like MiniMax's ref2va image "
+        "block - its own canvas, one slot on the clock before the target, labelled <Picture n> after "
+        "any keyframes - so the prompt can name it. Repeat for several. Every window gets it.",
+    )
+    parser.add_argument(
+        "--reference-size",
+        type=int,
+        default=2048,
+        metavar="PIXELS",
+        help="Short edge a reference image is encoded at (MiniMax's ref2va uses 2048). Smaller is "
+        "cheaper: rows grow with the square of this.",
+    )
+    parser.add_argument(
+        "--revoice-steps",
+        type=int,
+        default=0,
+        metavar="POINTS",
+        help="Re-voice: after the picture is made, switch the speed adapter off and re-make only the "
+        "sound with the base model over POINTS sigma points (POINTS-1 audio steps), the picture held "
+        "exactly as rendered. 0 (the default) is off. Runs only on windows rendered with --lora; "
+        "skipped for --audio-drive and --video-to-audio.",
+    )
+    parser.add_argument(
+        "--revoice-drop",
+        type=Path,
+        action="append",
+        default=None,
+        metavar="LORA",
+        help="The adapter(s) re-voice switches off (paths as given to --lora). Default: the first "
+        "--lora, which is where a speed adapter goes. Other LoRAs (a character's voice) stay on.",
+    )
+    parser.add_argument(
+        "--revoice-kv",
+        choices=("int8", "bf16", "off"),
+        default="int8",
+        help="Re-voice key/value store for the rows that do not change: int8 (default, half the "
+        "memory of bf16), bf16, or off = run the exact full forward on every audio step (slow).",
+    )
+    parser.add_argument(
+        "--revoice-strength",
+        type=float,
+        default=1.0,
+        metavar="SIGMA",
+        help="Where re-voice starts: 1.0 (default) re-makes the sound from noise; below 1 it starts "
+        "from the adapter's own sound noised to this level, keeping its timing (lip-sync) and "
+        "re-making its timbre. Only the schedule's points below SIGMA run.",
+    )
+    parser.add_argument(
+        "--revoice-keep-original",
+        action="store_true",
+        help="Research: also write the adapter's own sound beside the output as "
+        "<output>_adapter_audio.wav, for an A/B against the re-voiced track.",
+    )
     parser.add_argument("-o", "--output", type=Path, required=True)
     parser.add_argument("--metrics", type=Path, required=True)
     parser.add_argument(
@@ -1815,6 +2096,27 @@ def main() -> int:
         parser.error(str(exc))
     if subset is not None and len(subset[1]) != args.steps:
         parser.error(f"--sigma-subset keeps {len(subset[1])} points; pass --steps {len(subset[1])}")
+    if args.reference:
+        if args.draft_cache_dir is not None:
+            parser.error("--reference and --draft-cache-dir do not compose")
+        if args.reference_size < 256 or args.reference_size % 32:
+            parser.error("--reference-size must be a multiple of 32, at least 256")
+        for ref in args.reference:
+            if not Path(ref).is_file():
+                parser.error(f"--reference {ref} does not exist")
+        # The prompt cache is keyed on prompt + first frame; a reference changes the embedding.
+        args.prompt_cache = None
+    if not 0.05 <= args.revoice_strength <= 1.0:
+        parser.error("--revoice-strength must be in 0.05..1.0")
+    if args.revoice_steps and args.revoice_steps < 2:
+        parser.error("--revoice-steps must be 0 (off) or at least 2")
+    if args.revoice_steps and not args.lora:
+        parser.error("--revoice-steps re-makes the sound with an adapter switched off; pass --lora")
+    if args.revoice_drop:
+        given = {str(parse_lora_path(spec)) for spec in (args.lora or [])}
+        missing = [str(p) for p in args.revoice_drop if str(p) not in given]
+        if missing:
+            parser.error(f"--revoice-drop names adapters not passed with --lora: {missing}")
     if args.vae_dtype:
         import os
         os.environ["H3_VAE_DTYPE"] = args.vae_dtype
@@ -2052,6 +2354,11 @@ def main() -> int:
         "audio_mux": str(args.audio_mux) if args.audio_mux else None,
         "video_to_audio": str(args.video_to_audio) if args.video_to_audio else None,
         "skip_blocks": args.skip_blocks,
+        "references": [str(p) for p in (args.reference or [])] or None,
+        "reference_size": args.reference_size if args.reference else None,
+        "revoice_steps": args.revoice_steps or None,
+        "revoice_kv": args.revoice_kv if args.revoice_steps else None,
+        "revoice_drop": [str(p) for p in (args.revoice_drop or [])] or None,
         # Which video-VAE decode mode produced this run, so a metrics file is self-describing
         # when someone compares decode phases across the campaign. 0/1 is the per-tile loop.
         "vae_decode_dtype": resolved_decode_dtype(),
@@ -2109,6 +2416,11 @@ def main() -> int:
                 stretch=True,
             )
 
+        reference_images = []
+        if args.reference:
+            from minimax_h3_mlx.reference import prepare_reference_image
+
+            reference_images = [prepare_reference_image(p, args.reference_size) for p in args.reference]
         segments = []
         step_times = []
         window_report = []
@@ -2139,6 +2451,7 @@ def main() -> int:
             from PIL import Image
 
             cond = WindowConditioning()
+            cond.references = reference_images
             window_start = index * (frames - 1)  # frame 0 of this window on the new timeline
             continuing = bool(segments)
             first_frame_key = ""
@@ -2193,6 +2506,14 @@ def main() -> int:
                 key=lambda item: order.get(item[1], int(item[1].split(":")[1]) if ":" in item[1] else 0)
             )
             window_prompt = prompts[index]
+            if reference_images:
+                # References are labelled after this window's keyframes. A chain's later windows
+                # gain the carried hand-over frame, so "<Picture n>" naming a reference in window 1
+                # names it one later there.
+                if index == 0:
+                    ref_base_keyframes = len(cond.keyframes)
+                window_prompt = shift_reference_labels(
+                    window_prompt, ref_base_keyframes, len(cond.keyframes))
             if args.keyframe_alignment == "auto":
                 line = alignment_line([anchor for _, anchor in cond.keyframes], frames, window_prompt)
                 if line:

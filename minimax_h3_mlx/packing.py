@@ -283,6 +283,7 @@ def build_packed_sequence(
     history_latent_frames: int = 0,
     history_audio_latents: int = 0,
     history_audio_offset: float = 0.0,
+    reference_grids: tuple[tuple[int, int], ...] = (),
 ) -> PackedSequence:
     """Build the ``[text | video conditions | audio conditions | target audio | target video]`` layout.
 
@@ -305,6 +306,13 @@ def build_packed_sequence(
             carried video — non-zero only when the carried span is not a whole number of audio
             latents, so the audio can end exactly where the carried picture ends.
 
+        reference_grids: ``(latent_height, latent_width)`` of every reference IMAGE block, in packed
+            order. A reference is a single still on its own canvas and its own aspect-normalised
+            spatial grid (it never binds the target geometry), one integer rotary slot each, placed
+            on the clock before everything else - the official ``ref2va`` image block
+            (``packing_ref2va.build_ref2va_packed_sequence``), here carried by the FL2VA layout.
+            Packed first among the video conditioning rows.
+
     With no history the media clock starts at the text length, exactly as the reference builds it.
     With history the whole target moves later by the history's rotary span; the audio of both
     keeps the shared 40-units-per-second clock, so carried sound and carried picture stay in sync.
@@ -314,7 +322,9 @@ def build_packed_sequence(
     rows_per_frame = (latent_height // ph) * (latent_width // pw)
     num_text = int(text_tags.shape[0])
     num_history_rows = int(history_latent_frames) * rows_per_frame
-    num_condition_rows = num_history_rows + len(keyframe_anchors) * rows_per_frame
+    ref_rows = [(int(rh) // ph) * (int(rw) // pw) for rh, rw in reference_grids]
+    num_reference_rows = sum(ref_rows)
+    num_condition_rows = num_reference_rows + num_history_rows + len(keyframe_anchors) * rows_per_frame
     num_condition_audio_rows = int(history_audio_latents) * AUDIO_CHANNELS
     num_audio_rows = num_audio_latents * AUDIO_CHANNELS
     num_video_rows = num_latent_frames * rows_per_frame
@@ -327,15 +337,16 @@ def build_packed_sequence(
         else None
     )
 
-    condition_start = num_text
+    reference_start = num_text
+    condition_start = reference_start + num_reference_rows
     keyframe_start = condition_start + num_history_rows
-    audio_condition_start = condition_start + num_condition_rows
+    audio_condition_start = reference_start + num_condition_rows
     audio_start = audio_condition_start + num_condition_audio_rows
     video_start = audio_start + num_audio_rows
 
     # The media clock. Without history this is the reference's `num_text`; with history the target
     # begins one history span later, so the carried frames sit just before it in time.
-    media_origin = float(num_text)
+    media_origin = float(num_text) + float(len(reference_grids))
     target_origin = media_origin + (
         _temporal_position_span(history_latent_frames) if history_latent_frames else 0.0
     )
@@ -350,6 +361,18 @@ def build_packed_sequence(
     width_grid = _spatial_position_grid(latent_width, pw, sqrt_area)
     hh, ww = np.meshgrid(height_grid, width_grid, indexing="ij")
     frame_grid = np.stack([hh.reshape(-1), ww.reshape(-1)], axis=-1)
+
+    start = reference_start
+    for index, ((rh, rw), count) in enumerate(zip(reference_grids, ref_rows)):
+        r_area = np.sqrt(rh * rw)
+        r_hh, r_ww = np.meshgrid(
+            _spatial_position_grid(int(rh), ph, r_area), _spatial_position_grid(int(rw), pw, r_area),
+            indexing="ij",
+        )
+        position_ids[start:start + count, 0] = float(num_text) + index
+        position_ids[start:start + count, 1] = r_hh.reshape(-1)
+        position_ids[start:start + count, 2] = r_ww.reshape(-1)
+        start += count
 
     if history_latent_frames:
         history_pos = np.empty((history_latent_frames, rows_per_frame, 3), dtype=np.float64)
@@ -400,7 +423,7 @@ def build_packed_sequence(
 
     # 2. Row indices and modality tags. Conditioning rows lead each modality's index list.
     video_idx = np.concatenate(
-        [np.arange(condition_start, audio_condition_start), np.arange(video_start, seq_len)]
+        [np.arange(reference_start, audio_condition_start), np.arange(video_start, seq_len)]
     )
     audio_idx = np.arange(audio_condition_start, video_start)
     text_idx = np.arange(num_text)
