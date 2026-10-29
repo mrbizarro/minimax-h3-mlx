@@ -153,3 +153,65 @@ class MiniMaxH3Scheduler:
         prev = float(ratio) * sample.astype(mx.float32) + one_minus_ratio * denoised.astype(mx.float32)
         self._step_index += 1
         return prev.astype(sample.dtype)
+
+
+def shifted_knots(knots: list[float] | tuple[float, ...], shift: float) -> list[float]:
+    """Base-grid knots (x1000, first 1000, last 0) -> shifted sigmas for one modality.
+
+    ``sigma = q`` with ``q = knot / 1000``, pushed through the same exponential shift the dense
+    grid uses (``s*q / (1 + (s-1)*q)``), evaluated in float32 like :meth:`set_timesteps`. Few-step
+    students publish their ladder this way: one knot list, one shift per modality (Pika H3 Flex:
+    knots 1000,750,500,250,100,40,0 with video shift 12 and audio shift 3).
+    """
+    values = [float(k) for k in knots]
+    if len(values) < 2 or values[0] != 1000.0 or values[-1] != 0.0:
+        raise ValueError(f"sigma knots must start at 1000 and end at 0, got {values}")
+    if any(a <= b for a, b in zip(values, values[1:])):
+        raise ValueError(f"sigma knots must be strictly decreasing, got {values}")
+    q = np.asarray(values, dtype=np.float32) / np.float32(1000.0)
+    s32 = np.float32(shift)
+    out = (s32 * q) / (np.float32(1.0) + np.float32(shift - 1.0) * q)
+    return [float(v) for v in out.astype(np.float32).tolist()]
+
+
+class MiniMaxH3RenoiseScheduler(MiniMaxH3Scheduler):
+    """Consistency-style "re-noise" sampling for few-step H3 students.
+
+    Written for Pika H3 Flex (Pika Labs / Mellis, Inc., 2026-10-29), whose adapters were distilled
+    for this sampler, not for Euler. Our own MLX implementation of the published method:
+
+    * every forward predicts the clean sample, ``x0 = x_t + sigma * v`` (``v`` is H3's data-ward
+      velocity, exactly as in :meth:`MiniMaxH3Scheduler.step`);
+    * the next state is NOT an Euler blend toward ``x0``: it is ``x0`` re-noised to the next knot
+      with FRESH Gaussian noise, ``x_next = (1 - sigma_next) * x0 + sigma_next * eps``;
+    * the terminal knot is 0, so the last forward's ``x0`` is the result and the model is never
+      evaluated at sigma 0.
+
+    The fresh noise comes from a key derived from the render seed, one stream per scheduler, so a
+    seed reproduces on this Mac (it cannot match a CUDA run's draws, and nothing here pretends to).
+    """
+
+    def __init__(self, shift: float = 12.0, *, seed: int = 0, stream: int = 0):
+        super().__init__(shift=shift)
+        # Pika's reference uses seed + 1 for the re-noise draws; keep the same intent (independent
+        # of the initial-noise stream) with one MLX key per modality.
+        self._key = mx.random.key((int(seed) + 1) * 1009 + int(stream))
+
+    def step(self, model_output: mx.array, timestep: float, sample: mx.array) -> mx.array:
+        if isinstance(timestep, int):
+            raise ValueError(
+                "Passing integer indices as timesteps is not supported; pass one of the "
+                "`scheduler.timesteps` values."
+            )
+        if self._step_index is None:
+            self._step_index = self.index_for_timestep(timestep)
+        sigma_from_timestep = float(np.float32(1.0) - np.float32(timestep))
+        denoised = sample.astype(mx.float32) + sigma_from_timestep * model_output.astype(mx.float32)
+        sigma_next = float(np.float32(self.sigmas[self._step_index + 1].item()))
+        self._step_index += 1
+        if sigma_next == 0.0:
+            return denoised.astype(sample.dtype)
+        self._key, sub = mx.random.split(self._key)
+        eps = mx.random.normal(sample.shape, key=sub).astype(mx.float32)
+        prev = (1.0 - sigma_next) * denoised + sigma_next * eps
+        return prev.astype(sample.dtype)

@@ -84,7 +84,11 @@ from minimax_h3_mlx.render_guard import (
     nonfinite_error,
     nonfinite_flag,
 )
-from minimax_h3_mlx.scheduler import MiniMaxH3Scheduler
+from minimax_h3_mlx.scheduler import (
+    MiniMaxH3RenoiseScheduler,
+    MiniMaxH3Scheduler,
+    shifted_knots,
+)
 from minimax_h3_mlx.stepcache import StepResidualCache
 from minimax_h3_mlx.text_encoder import MiniMaxH3TextEncoder
 from minimax_h3_mlx.video_vae import resolved_decode_batch, resolved_decode_dtype
@@ -157,9 +161,44 @@ def parse_sigma_subset(spec: str | None) -> tuple[int, tuple[int, ...]] | None:
     return n, indices
 
 
-def build_schedules(points: int, config: PipelineConfig, subset=None):
-    video = MiniMaxH3Scheduler(shift=config.sigma_shift_video)
-    audio = MiniMaxH3Scheduler(shift=config.sigma_shift_audio)
+def parse_sigma_knots(spec: str | None) -> tuple[float, ...] | None:
+    """``"1000,750,500,250,100,40,0"`` -> the base-grid knots (x1000) of a few-step ladder."""
+    if not spec:
+        return None
+    knots = tuple(float(v) for v in str(spec).split(",") if v.strip())
+    shifted_knots(knots, 12.0)  # validation: starts at 1000, ends at 0, strictly decreasing
+    return knots
+
+
+# Pika H3 Flex (Pika Labs, released 2026-10-29) — the sampling its FL2VA/Ref2VA adapters were
+# distilled for, from the release's own manifest: six forwards at these base-grid knots, video
+# shift 12, audio shift 3, re-noise sampler. `--pika-flex` is shorthand for exactly this.
+PIKA_FLEX_KNOTS = (1000.0, 750.0, 500.0, 250.0, 100.0, 40.0, 0.0)
+PIKA_FLEX_VIDEO_SHIFT = 12.0
+PIKA_FLEX_AUDIO_SHIFT = 3.0
+
+
+def build_schedules(points: int, config: PipelineConfig, subset=None, *, knots=None,
+                    sampler: str = "euler", seed: int = 0):
+    """The video and audio schedules for one window.
+
+    ``knots`` (base-grid x1000, terminal 0) replaces the dense ``points`` grid with a few-step
+    ladder pushed through each modality's own shift. ``sampler="renoise"`` swaps the Euler update
+    for the consistency re-noise step few-step students are trained on (Pika H3 Flex)."""
+    if sampler == "renoise":
+        video = MiniMaxH3RenoiseScheduler(shift=config.sigma_shift_video, seed=seed, stream=0)
+        audio = MiniMaxH3RenoiseScheduler(shift=config.sigma_shift_audio, seed=seed, stream=1)
+    elif sampler == "euler":
+        video = MiniMaxH3Scheduler(shift=config.sigma_shift_video)
+        audio = MiniMaxH3Scheduler(shift=config.sigma_shift_audio)
+    else:
+        raise ValueError(f"unknown sampler {sampler!r}")
+    if knots is not None:
+        if subset is not None:
+            raise ValueError("sigma knots and a sigma subset do not compose")
+        video.set_timesteps(sigmas=shifted_knots(knots, config.sigma_shift_video))
+        audio.set_timesteps(sigmas=shifted_knots(knots, config.sigma_shift_audio))
+        return video, audio
     if subset is None:
         video.set_timesteps(points)
         audio.set_timesteps(points)
@@ -986,6 +1025,10 @@ def render_window(
     release()
 
     config = PipelineConfig()
+    if args.video_shift is not None:
+        config.sigma_shift_video = float(args.video_shift)
+    if args.audio_shift is not None:
+        config.sigma_shift_audio = float(args.audio_shift)
     latent_frames = video_latent_num_frames(frames)
     latent_h, latent_w = args.height // 16, args.width // 16
     audio_latents = audio_latent_num_frames(frames)
@@ -1189,9 +1232,16 @@ def render_window(
     record.flush()
 
     with record.phase(f"{label}adaln_cache_and_noise"):
-        video_sched, audio_sched = build_schedules(args.steps, config, parse_sigma_subset(args.sigma_subset))
+        video_sched, audio_sched = build_schedules(
+            args.steps, config, parse_sigma_subset(args.sigma_subset),
+            knots=parse_sigma_knots(args.sigma_knots), sampler=args.sampler, seed=seed,
+        )
         record.data[f"{label}schedule"] = {
             "sigma_subset": args.sigma_subset,
+            "sigma_knots": args.sigma_knots,
+            "sampler": args.sampler,
+            "video_shift": config.sigma_shift_video,
+            "audio_shift": config.sigma_shift_audio,
             "video_sigmas": [round(float(v), 7) for v in video_sched.sigmas.tolist()],
             "audio_sigmas": [round(float(v), 7) for v in audio_sched.sigmas.tolist()],
         }
@@ -1988,6 +2038,41 @@ def main() -> int:
         "TaoMate-H3's 3-forward ladder). --steps must equal the number of indices.",
     )
     parser.add_argument(
+        "--sigma-knots",
+        default=None,
+        metavar="1000,...,0",
+        help="A few-step ladder as base-grid knots x1000 (first 1000, last 0), pushed through each "
+        "modality's shift: K+1 knots = K forwards. --steps must equal the number of knots.",
+    )
+    parser.add_argument(
+        "--sampler",
+        choices=("euler", "renoise"),
+        default="euler",
+        help="'euler' (default) is H3's own rectified-flow step. 'renoise' predicts x0 at every knot "
+        "and re-noises it to the next knot with fresh noise - the sampler few-step consistency "
+        "students such as Pika H3 Flex were distilled for.",
+    )
+    parser.add_argument(
+        "--video-shift",
+        type=float,
+        default=None,
+        help="Video sigma shift (default 12, the release's). Few-step adapters distilled at another "
+        "shift publish it (lightx2v v1.3: 6).",
+    )
+    parser.add_argument(
+        "--audio-shift",
+        type=float,
+        default=None,
+        help="Audio sigma shift (default 3, the release's).",
+    )
+    parser.add_argument(
+        "--pika-flex",
+        action="store_true",
+        help="Pika H3 Flex sampling preset: --sampler renoise --sigma-knots "
+        "1000,750,500,250,100,40,0 --video-shift 12 --audio-shift 3 (6 forwards). Pass the "
+        "converted Flex adapter with --lora; this flag only sets the sampler.",
+    )
+    parser.add_argument(
         "--vae-dtype",
         choices=("float32", "float16", "bfloat16"),
         default=None,
@@ -2096,6 +2181,35 @@ def main() -> int:
         parser.error(str(exc))
     if subset is not None and len(subset[1]) != args.steps:
         parser.error(f"--sigma-subset keeps {len(subset[1])} points; pass --steps {len(subset[1])}")
+    if args.pika_flex:
+        if args.sigma_knots is None:
+            args.sigma_knots = ",".join(str(int(k)) for k in PIKA_FLEX_KNOTS)
+        args.sampler = "renoise"
+        if args.video_shift is None:
+            args.video_shift = PIKA_FLEX_VIDEO_SHIFT
+        if args.audio_shift is None:
+            args.audio_shift = PIKA_FLEX_AUDIO_SHIFT
+        # The ladder owns the forward count: K+1 knots = K forwards.
+        args.steps = len([v for v in args.sigma_knots.split(",") if v.strip()])
+    try:
+        knots = parse_sigma_knots(args.sigma_knots)
+    except ValueError as exc:
+        parser.error(f"--sigma-knots: {exc}")
+    if knots is not None:
+        if subset is not None:
+            parser.error("--sigma-knots and --sigma-subset do not compose")
+        if len(knots) != args.steps:
+            parser.error(f"--sigma-knots has {len(knots)} knots; pass --steps {len(knots)}")
+    for name in ("video_shift", "audio_shift"):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.sampler == "renoise":
+        if args.step_cache > 0 or args.step_cache_probe:
+            parser.error("--sampler renoise and --step-cache do not compose (each forward's input "
+                         "is freshly re-noised, so there is no residual to reuse)")
+        if args.revoice_steps:
+            parser.error("--sampler renoise and --revoice-steps do not compose")
     if args.reference:
         if args.draft_cache_dir is not None:
             parser.error("--reference and --draft-cache-dir do not compose")

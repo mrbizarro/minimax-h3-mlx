@@ -236,6 +236,33 @@ scripts/         bench_dit.py
 tests/           parity + smoke tests
 ```
 
+## Pika H3 Flex on Apple Silicon
+
+**Pika H3 Flex running natively on Apple Silicon (MLX) — first Mac port.**
+[Pika H3 Flex](https://huggingface.co/Pika-Labs/Pika-H3-Flex) (Pika Labs / Mellis, Inc.,
+2026-10-29) is a rank-128 LoRA on MiniMax H3 (base revision `42ed227`, whose transformer weights
+are byte-identical to the release this port runs) plus the few-step sampler it was distilled for.
+Pika ships it for NVIDIA GPUs only. This runner implements the method in its own MLX code:
+
+```
+--pika-flex   = --sampler renoise --sigma-knots 1000,750,500,250,100,40,0
+                --video-shift 12 --audio-shift 3   (6 forwards)
+--lora <pika_h3_flex_fl2va_phosphene.safetensors>:1.0
+```
+
+* `--sampler renoise` (`MiniMaxH3RenoiseScheduler`): each forward predicts the clean sample
+  `x0 = x_t + sigma * v`, which is re-noised to the next knot with fresh noise instead of an
+  Euler blend; the terminal knot is 0, so the last forward's `x0` is the result.
+* `--sigma-knots`: base-grid knots pushed through each modality's own shift.
+* The adapter is Pika's `fl2va/adapter.safetensors` re-laid out for this DiT (fused per-head qkv,
+  SwiGLU halves swapped, float32 to bfloat16). Phosphene's `scripts/fetch_h3_flex.py` builds it
+  from Pika's repo at a pinned revision; no weights are redistributed here.
+* FL2VA only (text, first frame). Pika's Ref2VA adapter targets the separate Ref2VA trunk.
+
+The adapter is a MiniMax H3 Model Derivative: MiniMax H3 Community License, copyright Mellis,
+Inc.; Pika's code is Apache-2.0. NOTICE: "MiniMax H3 is licensed under the MiniMax H3 Community
+License Agreement, Copyright © 2026 MiniMax. All Rights Reserved." Powered by MiniMax H3.
+
 ## License
 
 The port is Apache-2.0. The **weights** are governed by the
