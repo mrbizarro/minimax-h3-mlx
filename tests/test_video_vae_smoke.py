@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from minimax_h3_mlx.video_vae import (  # noqa: E402
     DEFAULT_DECODE_BATCH,
+    DEFAULT_DECODE_DTYPE,
     VideoVAE,
     VideoVAEConfig,
     resolved_decode_batch,
@@ -132,8 +133,69 @@ def main() -> int:
     rel = (mx.abs(half - ref).max() / (mx.abs(ref).max() + 1e-6)).item()
     check("float16 decode returns float32 and stays close", half.dtype == mx.float32 and rel < 1e-2,
           f"max rel diff {rel:.2e}")
+    # float16-mixed (the default since 2026-10-30): residual stream float32, projections and
+    # attention fp16. Must hand back float32 pixels, stay closer to float32 than the all-fp16
+    # stream does, and the compiled blocks must be the uncompiled mixed block bit for bit.
+    check("default decode dtype is float16-mixed", DEFAULT_DECODE_DTYPE == "float16-mixed")
+    # The block output scales initialise to zero, which would make every block the identity and
+    # every precision trivially equal. Give them real values first.
+    for block in model.decoder.transformer_blocks:
+        block.scale1 = (mx.random.uniform(0.1, 1.0, block.scale1.shape)).astype(block.scale1.dtype)
+        block.scale2 = (mx.random.uniform(0.1, 1.0, block.scale2.shape)).astype(block.scale2.dtype)
+    model.decode_dtype = "float32"
+    ref = model.decode(latent)
+    model.decode_dtype = "float16"
+    half = model.decode(latent)
+    mx.eval(ref, half)
+    rel = (mx.abs(half - ref).max() / (mx.abs(ref).max() + 1e-6)).item()
+    model.decode_dtype = "float16-mixed"
+    mixed = model.decode(latent)
+    os.environ["H3_VAE_COMPILE"] = "0"
+    try:
+        mixed_eager = model.decode(latent)
+        mx.eval(mixed, mixed_eager)
+    finally:
+        os.environ.pop("H3_VAE_COMPILE", None)
+    rel_mixed = (mx.abs(mixed - ref).max() / (mx.abs(ref).max() + 1e-6)).item()
+    check("float16-mixed returns float32 and stays close",
+          mixed.dtype == mx.float32 and rel_mixed < 1e-2 and rel_mixed <= rel,
+          f"max rel diff {rel_mixed:.2e} (all-fp16 {rel:.2e})")
+    check("compiled mixed blocks == eager mixed blocks", bool(mx.array_equal(mixed, mixed_eager).item()))
+
+    # Pipelined decode: the pieces concatenated are decode() bit for bit, padded tail included.
+    for frames_in in (5, 6, 7, 9):
+        z = mx.random.normal((1, config.latent_channels, frames_in, 96 // ratio, 160 // ratio))
+        for dtype in ("float32", "float16-mixed"):
+            model.decode_dtype = dtype
+            whole = model.decode(z)
+            pieces = list(model.decode_chunks(z))
+            joined = mx.concatenate(pieces, axis=2)
+            same = joined.shape == whole.shape and bool(mx.array_equal(joined, whole).item())
+            check(f"decode_chunks == decode ({frames_in} latent frames, {dtype})", same,
+                  f"{len(pieces)} pieces, {joined.shape} vs {whole.shape}")
     model.decode_dtype = "float32"
     model.decode_batch = DEFAULT_DECODE_BATCH
+
+    # Single-frame encode: a causal 3x3x3 conv over one frame is a Conv2d with the last temporal
+    # tap. Equal to float32 rounding (not bit-identical), and multi-frame encodes never take it.
+    model.tile_sample_min_height = model.tile_sample_min_width = 64
+    model.tile_sample_min_overlap_height = model.tile_sample_min_overlap_width = 16
+    for frames_in, label in ((1, "one frame"), (17, "17 frames")):
+        pixels = mx.random.uniform(-1, 1, (1, frames_in, 96, 160, 3))
+        os.environ["H3_VAE_ENCODER_CONV2D"] = "0"
+        try:
+            slow = model._encode_clip(pixels)
+        finally:
+            os.environ.pop("H3_VAE_ENCODER_CONV2D", None)
+        fast = model._encode_clip(pixels)
+        mx.eval(slow, fast)
+        rel_l2 = (mx.sqrt(((fast - slow) ** 2).sum()) / mx.sqrt((slow ** 2).sum())).item()
+        if frames_in == 1:
+            check("one-frame encode as Conv2d matches the 3D conv", fast.shape == slow.shape and rel_l2 < 1e-5,
+                  f"rel L2 {rel_l2:.2e}")
+        else:
+            check("17-frame encode is untouched by the Conv2d shortcut",
+                  bool(mx.array_equal(fast, slow).item()))
 
     print()
     if FAILURES:
