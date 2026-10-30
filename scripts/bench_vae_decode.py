@@ -37,6 +37,7 @@ from minimax_h3_mlx.stage_cache import load_stage_a  # noqa: E402
 
 spec = importlib.util.spec_from_file_location("generate_staged", ROOT / "scripts" / "generate_staged.py")
 staged = importlib.util.module_from_spec(spec)
+sys.modules["generate_staged"] = staged  # its dataclasses look their module up while being defined
 spec.loader.exec_module(staged)
 
 
