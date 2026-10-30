@@ -143,8 +143,16 @@ class VideoVAEConfig:
 
 
 def single_frame_conv2d() -> bool:
-    """Whether one-frame encodes (keyframes) take the 2D-conv shortcut (``H3_VAE_ENCODER_CONV2D``)."""
-    return os.environ.get("H3_VAE_ENCODER_CONV2D", "1") != "0"
+    """Whether one-frame encodes (keyframes) take the 2D-conv shortcut. OPT-IN: ``H3_VAE_ENCODER_CONV2D=1``.
+
+    Measured 2026-10-30, M4 Max: two 1024x576 anchors 2.28 s -> 0.90 s, latent relative L2
+    3.5e-6..3.9e-6 against the 3D conv. Small, but after the keyframe's seed-42 sample and float16
+    round trip 0.7% of the conditioning values move by one fp16 step, and the denoise carries that
+    into a different take: a 640x384 Flex Draft A/B (same seed) came out 37.8 dB apart with an audio
+    correlation of 0.65 — the same scene, but not the same clip. For about one second per anchor
+    that breaks seed reproducibility, so it stays off by default.
+    """
+    return os.environ.get("H3_VAE_ENCODER_CONV2D", "0") == "1"
 
 
 def reflect_pad(x: mx.array, axis: int, left: int, right: int) -> mx.array:
@@ -200,8 +208,8 @@ class CausalConv3d(nn.Module):
             # multiplies zeros, and the output is one frame deep whatever the temporal stride. So
             # the 3D conv is exactly a 2D conv with the last tap's kernel — two thirds fewer
             # multiply-adds for a keyframe. Same sum, different accumulation order, so the result
-            # is equal to float32 rounding, not bit-identical (H3_VAE_ENCODER_CONV2D=0 restores
-            # the 3D path).
+            # is equal to float32 rounding, not bit-identical, which is why it is opt-in
+            # (see single_frame_conv2d).
             out = mx.conv2d(x[:, 0], self.weight[:, -1], stride=self.stride[1:], padding=0)[:, None]
             if "bias" in self:
                 out = out + self.bias

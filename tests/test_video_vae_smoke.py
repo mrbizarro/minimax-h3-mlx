@@ -182,13 +182,13 @@ def main() -> int:
     model.tile_sample_min_overlap_height = model.tile_sample_min_overlap_width = 16
     for frames_in, label in ((1, "one frame"), (17, "17 frames")):
         pixels = mx.random.uniform(-1, 1, (1, frames_in, 96, 160, 3))
-        os.environ["H3_VAE_ENCODER_CONV2D"] = "0"
+        slow = model._encode_clip(pixels)  # the default: the 3D conv, as released
+        os.environ["H3_VAE_ENCODER_CONV2D"] = "1"
         try:
-            slow = model._encode_clip(pixels)
+            fast = model._encode_clip(pixels)
+            mx.eval(slow, fast)
         finally:
             os.environ.pop("H3_VAE_ENCODER_CONV2D", None)
-        fast = model._encode_clip(pixels)
-        mx.eval(slow, fast)
         rel_l2 = (mx.sqrt(((fast - slow) ** 2).sum()) / mx.sqrt((slow ** 2).sum())).item()
         if frames_in == 1:
             check("one-frame encode as Conv2d matches the 3D conv", fast.shape == slow.shape and rel_l2 < 1e-5,
