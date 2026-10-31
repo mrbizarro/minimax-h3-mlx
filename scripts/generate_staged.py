@@ -354,6 +354,25 @@ def media_mode_errors(args, parser) -> str:
     if args.chain_context_frames < 0 or args.chain_context_frames % CONTEXT_FRAME_STEP:
         parser.error(f"--chain-context-frames must be a multiple of {CONTEXT_FRAME_STEP} (0 = off)")
     keyframes = list(args.keyframe or [])
+    if args.refmod:
+        from minimax_h3_mlx.refmod_io import parse_spec
+
+        clash = [flag for flag, value in (
+            ("--first-frame", args.first_frame), ("--last-frame", args.last_frame),
+            ("--keyframe", keyframes), ("--extend-from", args.extend_from),
+            ("--video-to-audio", args.video_to_audio), ("--audio-drive", args.audio_drive),
+            ("--chain-windows", args.chain_windows != 1 or args.chain_total_frames is not None),
+            ("--chain-context-frames", args.chain_context_frames),
+        ) if value]
+        if clash:
+            parser.error(f"--refmod does not compose with {', '.join(clash)} (single window, no other media)")
+        for spec in args.refmod:
+            try:
+                path, _ = parse_spec(spec)
+            except ValueError as exc:
+                parser.error(str(exc))
+            if not Path(path).is_file() and not Path(path + ".safetensors").is_file():
+                parser.error(f"--refmod file does not exist: {path}")
     media = [
         name for name, value in (
             ("--extend-from", args.extend_from),
@@ -391,7 +410,7 @@ def media_mode_errors(args, parser) -> str:
                      "for an end target, not --first-frame/--keyframe")
     if args.extend_from is not None and args.audio_drive is not None:
         parser.error("--extend-from and --audio-drive do not compose (yet); extend, then lip-sync")
-    extra = media or args.last_frame is not None or keyframes or args.chain_context_frames
+    extra = media or args.last_frame is not None or keyframes or args.chain_context_frames or args.refmod
     if extra:
         for flag, value in (("--draft-fps", args.draft_fps), ("--playback-fps", args.playback_fps),
                             ("--draft-seconds", args.draft_seconds),
@@ -412,6 +431,8 @@ def media_mode_errors(args, parser) -> str:
             parser.error(f"--keyframe wants PATH@WHEN, got {spec!r}")
         if not Path(path).is_file():
             parser.error(f"--keyframe image does not exist: {path}")
+    if args.refmod:
+        return "refmod"
     if args.video_to_audio is not None:
         return "video_to_audio"
     if args.audio_drive is not None:
@@ -1043,15 +1064,34 @@ def render_window(
             history_rows if condition_rows is None
             else mx.concatenate([history_rows, condition_rows])
         )
+    # Ref2VA reference rows: saved latents, so no VAE is needed -- the rows are just read.
+    # media_mode_errors refuses every other condition source, so condition_rows is empty here.
+    ref_geoms = None
+    refmod_specs = list(getattr(args, "refmod", None) or [])
+    if refmod_specs:
+        from minimax_h3_mlx.refmod_io import load_refmod_rows
+
+        with record.phase(f"{label}refmod_load"):
+            condition_rows, ref_geoms, ref_names = load_refmod_rows(refmod_specs, patch)
+            mx.eval(condition_rows)
+        record.data[f"{label}refmods"] = ref_names
+        print(f"refmod conditioning rows: {condition_rows.shape} from {', '.join(ref_names)}")
     history_latent_frames = 0
     if history_rows is not None:
         history_latent_frames = int(history_rows.shape[0]) // ((latent_h // patch[1]) * (latent_w // patch[2]))
-    layout = build_packed_sequence(
-        text_tags, latent_frames, latent_h, latent_w, audio_latents, patch, anchors,
-        history_latent_frames=history_latent_frames,
-        history_audio_latents=history_audio_latents,
-        history_audio_offset=history_audio_offset,
-    )
+    if ref_geoms is not None:
+        from minimax_h3_mlx.ref2va_packing import build_ref2va_packed_sequence
+
+        layout = build_ref2va_packed_sequence(
+            text_tags, ref_geoms, latent_frames, latent_h, latent_w, audio_latents, patch
+        )
+    else:
+        layout = build_packed_sequence(
+            text_tags, latent_frames, latent_h, latent_w, audio_latents, patch, anchors,
+            history_latent_frames=history_latent_frames,
+            history_audio_latents=history_audio_latents,
+            history_audio_offset=history_audio_offset,
+        )
     n_target_video = int(layout.video_indices.shape[0]) - layout.num_condition_video_rows
     n_target_audio = int(layout.audio_indices.shape[0]) - layout.num_condition_audio_rows
     frozen_video_mask = None
@@ -1566,6 +1606,15 @@ def main() -> int:
         help="Recommended native-motion TAE preset: 3/5 seconds use one H3 window; 10/15 "
         "seconds use two/three conditioned windows and trim to exactly 240/360 frames. This "
         "overrides --frames and is only legal with --draft-decode tae.",
+    )
+    parser.add_argument(
+        "--refmod",
+        action="append",
+        default=None,
+        metavar="PATH[:STRENGTH]",
+        help="Ref2VA reference conditioning from a saved RefMod (.safetensors, ComfyUI-MiniMaxH3Mod): "
+        "its latent rides as reference rows. Repeatable; STRENGTH 0..1 blends toward a blurred copy. "
+        "Needs a Ref2VA --dit; composes with no other media flag and no chaining.",
     )
     parser.add_argument(
         "--first-frame",

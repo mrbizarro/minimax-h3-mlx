@@ -1,0 +1,156 @@
+{
+ "one_image": {
+  "num_text": 9,
+  "refs": [
+   {
+    "kind": "image",
+    "num_latent_frames": 1,
+    "latent_height": 16,
+    "latent_width": 28,
+    "num_audio_latents": 0
+   }
+  ],
+  "target": [
+   3,
+   8,
+   12,
+   10
+  ],
+  "seq": 213,
+  "cond_v": 112,
+  "cond_a": 0
+ },
+ "two_images": {
+  "num_text": 14,
+  "refs": [
+   {
+    "kind": "image",
+    "num_latent_frames": 1,
+    "latent_height": 16,
+    "latent_width": 28,
+    "num_audio_latents": 0
+   },
+   {
+    "kind": "image",
+    "num_latent_frames": 1,
+    "latent_height": 24,
+    "latent_width": 16,
+    "num_audio_latents": 0
+   }
+  ],
+  "target": [
+   3,
+   8,
+   12,
+   10
+  ],
+  "seq": 314,
+  "cond_v": 208,
+  "cond_a": 0
+ },
+ "audio_only": {
+  "num_text": 6,
+  "refs": [
+   {
+    "kind": "audio",
+    "num_latent_frames": 0,
+    "latent_height": 0,
+    "latent_width": 0,
+    "num_audio_latents": 20
+   }
+  ],
+  "target": [
+   3,
+   8,
+   8,
+   8
+  ],
+  "seq": 110,
+  "cond_v": 0,
+  "cond_a": 40
+ },
+ "video_with_aud": {
+  "num_text": 11,
+  "refs": [
+   {
+    "kind": "video",
+    "num_latent_frames": 7,
+    "latent_height": 8,
+    "latent_width": 12,
+    "num_audio_latents": 15
+   }
+  ],
+  "target": [
+   7,
+   8,
+   12,
+   12
+  ],
+  "seq": 401,
+  "cond_v": 168,
+  "cond_a": 30
+ },
+ "video_silent": {
+  "num_text": 11,
+  "refs": [
+   {
+    "kind": "video",
+    "num_latent_frames": 17,
+    "latent_height": 8,
+    "latent_width": 12,
+    "num_audio_latents": 0
+   }
+  ],
+  "target": [
+   3,
+   8,
+   12,
+   10
+  ],
+  "seq": 511,
+  "cond_v": 408,
+  "cond_a": 0
+ },
+ "mixed": {
+  "num_text": 20,
+  "refs": [
+   {
+    "kind": "image",
+    "num_latent_frames": 1,
+    "latent_height": 16,
+    "latent_width": 28,
+    "num_audio_latents": 0
+   },
+   {
+    "kind": "audio",
+    "num_latent_frames": 0,
+    "latent_height": 0,
+    "latent_width": 0,
+    "num_audio_latents": 10
+   },
+   {
+    "kind": "video",
+    "num_latent_frames": 12,
+    "latent_height": 8,
+    "latent_width": 12,
+    "num_audio_latents": 18
+   },
+   {
+    "kind": "image",
+    "num_latent_frames": 1,
+    "latent_height": 12,
+    "latent_width": 12,
+    "num_audio_latents": 0
+   }
+  ],
+  "target": [
+   7,
+   8,
+   12,
+   16
+  ],
+  "seq": 712,
+  "cond_v": 436,
+  "cond_a": 56
+ }
+}
