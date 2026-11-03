@@ -21,6 +21,13 @@ from test_dit_smoke import tiny_config  # noqa: E402
 from test_ph3_image_vae import TINY  # noqa: E402
 
 
+class TestAdapterLayout(unittest.TestCase):
+    def test_layout_flags_are_the_measured_ones(self):
+        # Measured against the base weights, not assumed (see ph3_image.py): qkv permuted, fc1 not.
+        self.assertTrue(P.ADAPTER_QKV_PERMUTE)
+        self.assertFalse(P.ADAPTER_FC1_SWAP)
+
+
 class TestSchedule(unittest.TestCase):
     def test_grid_is_the_checkpoints_and_eight_forwards(self):
         self.assertEqual(len(P.SAMPLE_SIGMAS), 9)

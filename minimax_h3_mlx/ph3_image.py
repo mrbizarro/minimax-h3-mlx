@@ -36,6 +36,14 @@ SAMPLE_SIGMAS = (1.0, 0.984753, 0.967905, 0.951688, 0.925372, 0.881923, 0.810083
 STEPS = len(SAMPLE_SIGMAS)
 FORWARDS = STEPS - 1
 
+# Adapter layout, decided against the BASE weights (a remote probe of blocks.0 of Pruna's published
+# transformer against our pruned FL2VA, 3 Nov 2026): delta = W_pruna - W_base is explained by B@A
+# at scale 1.000 only with the qkv rows permuted (contiguous q|k|v -> our per-head interleave:
+# cos +0.58 vs +0.005 as-is) and the fc1 rows AS-IS (cos +0.50 vs -0.002 swapped). The cosine is
+# bounded by bf16 rounding of the published weights, the scalar is not. fc2 is as-is too.
+ADAPTER_QKV_PERMUTE = True
+ADAPTER_FC1_SWAP = False
+
 NUM_AUDIO_LATENTS = 2  # per channel, discarded
 CANVAS_MULTIPLE = 32  # 16x VAE x 2x2 patch
 
@@ -177,7 +185,8 @@ class PH3ImageRunner:
         accounting = None
         if self.lora_path:
             reports = apply_loras(dit, [(Path(self.lora_path), float(self.lora_scale))],
-                                  mode=self.lora_mode, verbose=verbose, permute_qkv=True, swap_fc1=True)
+                                  mode=self.lora_mode, verbose=verbose,
+                                  permute_qkv=ADAPTER_QKV_PERMUTE, swap_fc1=ADAPTER_FC1_SWAP)
             accounting = reports[0].summary()
             m["lora"] = accounting
         started = time.perf_counter()
