@@ -45,6 +45,7 @@ class MiniMaxH3TextEncoder:
         load_vision: bool = True,
         verbose: bool = False,
         config_path: str | Path | None = None,
+        taps: tuple[int, ...] | None = None,
     ):
         from mlx_vlm.models.qwen3_vl.config import ModelConfig, TextConfig, VisionConfig
         from mlx_vlm.models.qwen3_vl.language import Qwen3VLModel
@@ -55,7 +56,10 @@ class MiniMaxH3TextEncoder:
             raw = json.load(fh)
 
         full_layers = raw["text_config"]["num_hidden_layers"]
-        if full_layers <= num_layers:
+        # ``taps`` (P-H3-Image) reads several hidden states of the whole stack, the last one after
+        # the final norm, so the stack may be exactly as deep as the checkpoint.
+        self.taps = tuple(taps) if taps else None
+        if full_layers < num_layers or (full_layers == num_layers and self.taps is None):
             raise ValueError(
                 f"MiniMax-H3 conditions on hidden_states[{num_layers}] of its Qwen3-VL conditioner, "
                 f"which needs more than {num_layers} decoder layers, but the checkpoint has "
@@ -168,7 +172,8 @@ class MiniMaxH3TextEncoder:
         }
         # Compact H3 exports omit the final language norm because conditioning is read before it.
         # The module retains its tiny initialized norm for mlx-vlm structural compatibility.
-        expected["language"].discard("norm.weight")
+        if self.taps is None:
+            expected["language"].discard("norm.weight")
         skipped = 0
         for shard in shards:
             for key, tensor in mx.load(shard).items():
@@ -328,10 +333,24 @@ class MiniMaxH3TextEncoder:
         if position_ids is not None and not model.layers[0].self_attn.rotary_emb.fused_apply:
             position_embeddings = model.layers[0].self_attn.rotary_emb(h, position_ids)
 
+        wanted = set(self.taps) if self.taps else set()
+        tapped: dict[int, mx.array] = {}
+        if 0 in wanted:
+            tapped[0] = h
         for layer_idx, layer in enumerate(model.layers):
             h = layer(h, mask, None, position_ids, position_embeddings)
             if deepstack_visual_embeds is not None and layer_idx < len(deepstack_visual_embeds):
                 h = model._deepstack_process(h, visual_pos_masks, deepstack_visual_embeds[layer_idx])
+            # Diffusers' numbering: index i is the output of decoder layer i (0 = embeddings),
+            # and the last index of a full stack is the final-normed state.
+            index = layer_idx + 1
+            if index in wanted and index < len(model.layers):
+                tapped[index] = h
+        if self.taps:
+            last = len(model.layers)
+            if last in wanted:
+                tapped[last] = model.norm(h)
+            return mx.concatenate([tapped[i] for i in self.taps], axis=-1)
         # No `model.norm(h)`: H3 conditions on the unnormalized state.
         return h
 
