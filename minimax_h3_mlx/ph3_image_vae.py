@@ -25,7 +25,7 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx.utils import tree_unflatten
+from mlx.utils import tree_flatten, tree_unflatten
 
 from .video_vae import VideoVAE, VideoVAEConfig, ViTDecoder3d
 
@@ -153,23 +153,31 @@ class PH3ImageVAE(VideoVAE):
 # ---------------------------------------------------------------------------------------------
 
 
-def _fuse_qkv(q: np.ndarray, k: np.ndarray, v: np.ndarray, heads: int) -> np.ndarray:
-    """Three ``(heads * hd, ...)`` projections -> our per-head interleaved ``(heads, 3, hd, ...)``."""
+def _xp(a):
+    return mx if isinstance(a, mx.array) else np
+
+
+def _fuse_qkv(q, k, v, heads: int):
+    """Three ``(heads * hd, ...)`` projections -> our per-head interleaved ``(heads, 3, hd, ...)``.
+
+    Works on numpy or MLX arrays (the converter streams MLX bf16 tensors, which numpy cannot hold).
+    """
     hd = q.shape[0] // heads
-    stacked = np.stack([a.reshape(heads, hd, *a.shape[1:]) for a in (q, k, v)], axis=1)
+    xp = _xp(q)
+    stacked = xp.stack([a.reshape(heads, hd, *a.shape[1:]) for a in (q, k, v)], axis=1)
     return stacked.reshape(3 * heads * hd, *q.shape[1:])
 
 
-def convert_decoder_state(tensors: dict[str, np.ndarray], config: VideoVAEConfig) -> dict[str, np.ndarray]:
+def convert_decoder_state(tensors: dict, config: VideoVAEConfig) -> dict:
     """Map Diffusers ``decoder.*`` / ``post_quant_conv.*`` tensors onto :class:`PH3ImageVAE` names.
 
     Only the decoder side is converted; encoder tensors are ignored (they are not needed for
     text-to-image). Raises if a block is missing a tensor.
     """
     heads = config.decoder_num_attention_heads
-    out: dict[str, np.ndarray] = {}
+    out: dict = {}
 
-    def take(key: str) -> np.ndarray:
+    def take(key: str):
         try:
             return tensors[key]
         except KeyError as exc:
@@ -196,7 +204,7 @@ def convert_decoder_state(tensors: dict[str, np.ndarray], config: VideoVAEConfig
             # Diffusers SwiGLU is value-first, ``value * silu(gate)``; ours is ``[gate; up]``.
             proj = take(src + f"ff.net.0.proj.{leaf}")
             half = proj.shape[0] // 2
-            out[dst + f"ff.w1.{leaf}"] = np.concatenate([proj[half:], proj[:half]], axis=0)
+            out[dst + f"ff.w1.{leaf}"] = _xp(proj).concatenate([proj[half:], proj[:half]], axis=0)
             out[dst + f"ff.w2.{leaf}"] = take(src + f"ff.net.2.{leaf}")
 
     pq = take("post_quant_conv.weight")
@@ -211,9 +219,9 @@ def load_image_vae(path: str | Path, config_json: dict, dtype: mx.Dtype = mx.bfl
     model = PH3ImageVAE(cfg)
     raw = mx.load(str(path))
     if "decoder.x_embedder.weight" not in raw:  # Diffusers layout
-        raw = {k: mx.array(v) for k, v in convert_decoder_state({k: np.asarray(v.astype(mx.float32)) for k, v in raw.items()}, cfg).items()}
+        raw = convert_decoder_state(raw, cfg)
     weights = {k: v.astype(dtype) for k, v in raw.items()}
-    expected = {k for k, _ in __import__("mlx.utils", fromlist=["tree_flatten"]).tree_flatten(model.parameters())}
+    expected = {k for k, _ in tree_flatten(model.parameters())}
     missing, extra = sorted(expected - weights.keys()), sorted(weights.keys() - expected)
     if missing or extra:
         raise KeyError(f"image VAE mismatch: missing {missing[:4]}, unexpected {extra[:4]}")
