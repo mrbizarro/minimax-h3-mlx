@@ -132,7 +132,8 @@ def convert_decoder(source: Path, config_path: Path, dest: Path) -> str:
     tensors = mx.load(str(source))
     out = convert_decoder_state(tensors, cfg)
     mx.eval(list(out.values()))
-    tmp = dest.with_suffix(".tmp")
+    # mx.save_safetensors appends ".safetensors" to a name without it, so name the temp file fully.
+    tmp = dest.with_name(dest.stem + ".tmp.safetensors")
     mx.save_safetensors(str(tmp), out, metadata={
         "modification_notice": MODIFICATION_NOTICE,
         "source_repo": DIFFUSERS_REPO, "source_revision": DIFFUSERS_REVISION,
