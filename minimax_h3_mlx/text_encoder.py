@@ -71,7 +71,7 @@ class MiniMaxH3TextEncoder:
         self.full_layers = full_layers
         self.dtype = dtype
 
-        text_raw = dict(raw["text_config"])
+        text_raw = _legacy_rope(dict(raw["text_config"]))
         text_raw["num_hidden_layers"] = num_layers  # build only what we evaluate
         self.text_config = TextConfig.from_dict(text_raw)
         self.vision_config = VisionConfig.from_dict(raw["vision_config"])
@@ -429,3 +429,17 @@ def _masked_scatter(target: mx.array, mask: mx.array, values: mx.array) -> mx.ar
     positions = mx.array(np.where(np.array(mx.flatten(mask)))[0], mx.uint32)
     flat[positions] = mx.flatten(values)
     return mx.reshape(flat, shape)
+
+
+def _legacy_rope(text_raw: dict) -> dict:
+    """transformers 5 writes ``rope_parameters`` (theta inside); mlx-vlm wants ``rope_theta`` + ``rope_scaling``.
+
+    P-H3-Image's Qwen3-VL config is in the new form; H3's own is in the old one and passes through unchanged.
+    """
+    params = text_raw.get("rope_parameters")
+    if "rope_theta" not in text_raw and isinstance(params, dict):
+        params = dict(params)
+        text_raw["rope_theta"] = params.pop("rope_theta")
+        text_raw.setdefault("rope_scaling", params)
+        text_raw.pop("rope_parameters")
+    return text_raw
