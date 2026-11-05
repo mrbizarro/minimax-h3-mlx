@@ -5,6 +5,13 @@ MiniMax's omni-modal generative system for synchronized **video + audio** genera
 
 > Powered by MiniMax H3.
 
+> ### Just want to use it? Get [Phosphene](https://phosphene.video)
+> **[Phosphene](https://phosphene.video)** is the free, open-source Mac app built on this port: H3 video with
+> synced sound and dialogue, plus **P-H3-Image by [Pruna AI](https://huggingface.co/PrunaAI)**, the first Mac port of it as far
+> as we know (8-megapixel images, about 5 minutes each on an M4 Max, quoted text spelled exactly). One-click
+> install through Pinokio, no terminal. **[phosphene.video](https://phosphene.video)** ·
+> [GitHub](https://github.com/mrbizarro/Phosphene) · [P-H3-Image how-to](https://phosphene.video/docs/images/#p-h3-image)
+
 H3 is **not** a language model. It is a diffusers pipeline: a 33B diffusion transformer denoising
 video and audio latents jointly, conditioned by a frozen Qwen3-VL-32B encoder, with separate video
 and audio VAEs. There is no autoregressive decoding and no `mlx_lm.convert` path — this repository
