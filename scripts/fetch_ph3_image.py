@@ -32,9 +32,12 @@ LORA_SHA256 = "0e9013ae2873e3415dcb7bb59a9677293bdbdb6f663e138a79bb9bdced00ea61"
 
 VAE_SOURCE = "vae/diffusion_pytorch_model.safetensors"
 DECODER_NAME = "decoder.safetensors"
-# The converted decoder is deterministic (renames + re-fused tensors, values unchanged, fixed metadata):
-# its sha256, measured on an M4 Max with the H3 venv's mlx, 4 Nov 2026 and again on the in-app install.
-DECODER_SHA256 = "0415dda9059a13d57b6b482b52cbe804f8ebed7c9786fae7f65562a2da7c5c94"
+# The converted decoder is deterministic (renamed tensors, q/k/v fused per head and the SwiGLU halves swapped;
+# values unchanged). Verified by the digest of its TENSORS (tensors_sha256), which does not depend on how a given
+# mlx lays out the file header. Measured 5 Nov 2026 on two independent conversions (bench + in-app install), whose
+# whole-file sha256 was also identical: DECODER_FILE_SHA256 (mlx 0.32.x), kept for the record.
+DECODER_TENSORS_SHA256 = "bc1d55c887b72dbe85caa941bc3e74c419617e5708f965d4291b300e605e3e4b"
+DECODER_FILE_SHA256 = "0415dda9059a13d57b6b482b52cbe804f8ebed7c9786fae7f65562a2da7c5c94"
 MODIFICATION_NOTICE = (
     "Modified by Phosphene: the image decoder tensors of PrunaAI/P-H3-Image (vae/) were renamed and "
     "re-fused (to_q/to_k/to_v -> to_qkv, SwiGLU halves swapped) for the MLX runner. Values unchanged. "
@@ -100,28 +103,70 @@ def sha256_of(path: Path) -> str:
 
 
 def fetch(repo: str, revision: str, rel: str, dest: Path, size: int, sha: str | None) -> Path:
-    """Download one pinned file (resumable) and verify it. Returns the path."""
+    """Download one pinned file (resumable) and verify it. Returns the path.
+
+    A stalled connection times out (60 s without data) instead of hanging the install. A `.part`
+    that is already complete goes straight to verification; one that is too big, or a server that
+    ignores the Range request, starts the file over instead of appending to it."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists() and dest.stat().st_size == size and (sha is None or sha256_of(dest) == sha):
         return dest
     part = dest.with_suffix(dest.suffix + ".part")
     have = part.stat().st_size if part.exists() else 0
-    req = urllib.request.Request(url(repo, revision, rel))
-    if have:
-        req.add_header("Range", f"bytes={have}-")
-    with urllib.request.urlopen(req) as resp, open(part, "ab" if have else "wb") as out:
-        while True:
-            block = resp.read(1 << 22)
-            if not block:
-                break
-            out.write(block)
-    if part.stat().st_size != size:
-        raise RuntimeError(f"{rel}: expected {size} bytes, got {part.stat().st_size}")
+    if have > size:
+        part.unlink()
+        have = 0
+    if have < size:
+        req = urllib.request.Request(url(repo, revision, rel))
+        if have:
+            req.add_header("Range", f"bytes={have}-")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            resume = bool(have) and getattr(resp, "status", 200) == 206
+            with open(part, "ab" if resume else "wb") as out:
+                while True:
+                    block = resp.read(1 << 22)
+                    if not block:
+                        break
+                    out.write(block)
+    got = part.stat().st_size
+    if got != size:
+        if got > size:
+            part.unlink()
+        raise RuntimeError(f"{rel}: expected {size} bytes, got {got} (run again to "
+                           + ("start it over)" if got > size else "resume)"))
     if sha is not None and sha256_of(part) != sha:
         part.unlink()
         raise RuntimeError(f"{rel}: sha256 mismatch (file removed, run again)")
     part.rename(dest)
     return dest
+
+
+def _decoder_digest(path: Path) -> str:
+    return tensors_sha256(path)
+
+
+def tensors_sha256(path: Path) -> str:
+    """Digest of a safetensors file's TENSORS (name, dtype, shape, raw bytes, in name order), not of
+    its header layout, so a different mlx writing the same values gives the same digest."""
+    import struct
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(n))
+        base = 8 + n
+        for name in sorted(k for k in header if k != "__metadata__"):
+            t = header[name]
+            h.update(f"{name}|{t['dtype']}|{t['shape']}\n".encode())
+            start, end = t["data_offsets"]
+            f.seek(base + start)
+            left = end - start
+            while left:
+                block = f.read(min(left, 1 << 22))
+                if not block:
+                    raise RuntimeError(f"{path.name}: truncated tensor {name}")
+                h.update(block)
+                left -= len(block)
+    return h.hexdigest()
 
 
 def convert_decoder(source: Path, config_path: Path, dest: Path) -> str:
@@ -172,9 +217,9 @@ def main(argv=None) -> int:
         return 0
 
     decoder = root / "vae" / DECODER_NAME
-    decoder_ok = decoder.exists() and sha256_of(decoder) == DECODER_SHA256
+    decoder_ok = decoder.exists() and _decoder_digest(decoder) == DECODER_TENSORS_SHA256
     if decoder.exists() and not decoder_ok:
-        print("decoder on disk does not match its sha256; building it again", flush=True)
+        print("decoder on disk does not match its digest; building it again", flush=True)
         decoder.unlink()
     files = dict(CORE_FILES)
     if decoder_ok and not args.keep_source:
@@ -186,17 +231,18 @@ def main(argv=None) -> int:
         print("ok", rel, flush=True)
 
     if not decoder_ok:
-        print("decoder converting (renames only, values unchanged)", flush=True)
-        digest = convert_decoder(root / VAE_SOURCE, root / "vae" / "config.json", decoder)
-        if digest != DECODER_SHA256:
+        print("decoder converting (renamed and re-fused tensors, values unchanged)", flush=True)
+        file_sha = convert_decoder(root / VAE_SOURCE, root / "vae" / "config.json", decoder)
+        digest = _decoder_digest(decoder)
+        if digest != DECODER_TENSORS_SHA256:
             decoder.unlink()
-            print(f"error: the converted decoder's sha256 {digest[:12]} is not the expected {DECODER_SHA256[:12]}; "
-                  "removed it. Report this line.", file=sys.stderr, flush=True)
+            print(f"error: the converted decoder's tensors digest {digest[:12]} is not the expected "
+                  f"{DECODER_TENSORS_SHA256[:12]}; removed it. Report this line.", file=sys.stderr, flush=True)
             return 3
-        (root / "vae" / (DECODER_NAME + ".sha256")).write_text(digest + "\n")
-        print("decoder converted", digest[:12], "sha256 verified", flush=True)
+        (root / "vae" / (DECODER_NAME + ".sha256")).write_text(file_sha + "\n")
+        print("decoder converted", digest[:12], "verified", flush=True)
     else:
-        print("decoder ok", DECODER_SHA256[:12], flush=True)
+        print("decoder ok", DECODER_TENSORS_SHA256[:12], flush=True)
     if not args.keep_source and (root / VAE_SOURCE).exists():
         (root / VAE_SOURCE).unlink()
     return 0
