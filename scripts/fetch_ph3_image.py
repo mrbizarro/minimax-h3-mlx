@@ -186,6 +186,7 @@ def main(argv=None) -> int:
         print("ok", rel, flush=True)
 
     if not decoder_ok:
+        print("decoder converting (renames only, values unchanged)", flush=True)
         digest = convert_decoder(root / VAE_SOURCE, root / "vae" / "config.json", decoder)
         if digest != DECODER_SHA256:
             decoder.unlink()
