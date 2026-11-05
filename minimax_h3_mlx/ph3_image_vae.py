@@ -27,7 +27,7 @@ import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten, tree_unflatten
 
-from .video_vae import VideoVAE, VideoVAEConfig, ViTDecoder3d
+from .video_vae import VideoVAE, VideoVAEConfig, ViTDecoder3d, _apply_vit_rotary
 
 # Rotary time shared by every token of the decoded frame (the reference's FRAME_POSITION).
 FRAME_POSITION = 2.0 * (0.5 / 7) - 1.0
@@ -35,6 +35,63 @@ FRAME_POSITION = 2.0 * (0.5 / 7) - 1.0
 # Pixel convention of the H3 VAE family: ImageNet statistics over [0, 1].
 PIXEL_MEAN = (0.485, 0.456, 0.406)
 PIXEL_STD = (0.229, 0.224, 0.225)
+
+
+# --- Mixed-precision block (self-contained) --------------------------------------------------
+# The image decoder runs its 36 blocks with half-precision projections and a float32 residual
+# stream. That path is written here, on top of the plain ``ViTBlock`` parts, so this module does
+# not depend on any other change to ``video_vae.py`` (the 4.19 engine line has the plain block).
+
+def _half_linear(layer: nn.Linear, x: mx.array, compute) -> mx.array:
+    """``layer(x)`` with weight and bias in ``compute`` (a no-op cast for fp16/bf16 weights)."""
+    weight = layer.weight if layer.weight.dtype == compute else layer.weight.astype(compute)
+    if "bias" in layer:
+        bias = layer.bias if layer.bias.dtype == compute else layer.bias.astype(compute)
+        return mx.addmm(bias, x, weight.T)
+    return x @ weight.T
+
+
+def _mixed_attention(attn, h: mx.array, rotary, compute) -> mx.array:
+    b, n, _ = h.shape
+    qkv = _half_linear(attn.to_qkv, h, compute).reshape(b, n, attn.heads, 3, attn.dim_head)
+    q, k, v = qkv[:, :, :, 0], qkv[:, :, :, 1], qkv[:, :, :, 2]
+    q = attn._rms_norm_f32(q.astype(mx.float32))
+    k = attn._rms_norm_f32(k.astype(mx.float32))
+    if rotary is not None:
+        q = _apply_vit_rotary(q, *rotary)
+        k = _apply_vit_rotary(k, *rotary)
+    q = q.astype(compute).transpose(0, 2, 1, 3)
+    k = k.astype(compute).transpose(0, 2, 1, 3)
+    v = v.transpose(0, 2, 1, 3)
+    out = mx.fast.scaled_dot_product_attention(q, k, v, scale=attn.scale)
+    out = out.transpose(0, 2, 1, 3).reshape(b, n, attn.heads * attn.dim_head)
+    return _half_linear(attn.to_out, out, compute)
+
+
+def _mixed_feed_forward(ff, h: mx.array, compute) -> mx.array:
+    fused = _half_linear(ff.w1, h, compute)
+    gate, up = fused[..., : ff._inner], fused[..., ff._inner :]
+    return _half_linear(ff.w2, nn.silu(gate) * up, compute)
+
+
+def _mixed_block(block, x: mx.array, rotary, compute) -> mx.array:
+    """One ViTBlock with half-precision projections; ``x`` (the residual stream) stays float32."""
+    h = block.norm1(x).astype(compute)
+    x = x + _mixed_attention(block.attn, h, rotary, compute).astype(mx.float32) * block.scale1
+    h = block.norm2(x).astype(compute)
+    return x + _mixed_feed_forward(block.ff, h, compute).astype(mx.float32) * block.scale2
+
+
+def _run_block(block, tokens: mx.array, rotary, compute) -> mx.array:
+    if compute is None:
+        return block(tokens, rotary)
+    key = f"_ph3_compiled_{compute}"
+    fn = block.__dict__.get(key)
+    if fn is None:
+        # `inputs=block.state` keeps the block's parameters live inputs of the compiled graph.
+        fn = mx.compile(lambda x, cos, sin: _mixed_block(block, x, (cos, sin), compute), inputs=block.state)
+        block.__dict__[key] = fn
+    return fn(tokens, *rotary)
 
 
 def image_vae_config(raw: dict) -> VideoVAEConfig:
@@ -88,7 +145,7 @@ class PH3ImageDecoder(ViTDecoder3d):
         rotary = self.rope(mx.concatenate([position_ids, suffix], axis=1))
 
         for block in self.transformer_blocks:
-            tokens = block(tokens, rotary, compute)
+            tokens = _run_block(block, tokens, rotary, compute)
 
         normed = self.norm_out(tokens.astype(mx.float32)).astype(tokens.dtype)
         tokens = self.proj_out(normed)[:, :num_patches, :]
