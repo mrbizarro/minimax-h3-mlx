@@ -32,6 +32,9 @@ LORA_SHA256 = "0e9013ae2873e3415dcb7bb59a9677293bdbdb6f663e138a79bb9bdced00ea61"
 
 VAE_SOURCE = "vae/diffusion_pytorch_model.safetensors"
 DECODER_NAME = "decoder.safetensors"
+# The converted decoder is deterministic (renames + re-fused tensors, values unchanged, fixed metadata):
+# its sha256, measured on an M4 Max with the H3 venv's mlx, 4 Nov 2026 and again on the in-app install.
+DECODER_SHA256 = "0415dda9059a13d57b6b482b52cbe804f8ebed7c9786fae7f65562a2da7c5c94"
 MODIFICATION_NOTICE = (
     "Modified by Phosphene: the image decoder tensors of PrunaAI/P-H3-Image (vae/) were renamed and "
     "re-fused (to_q/to_k/to_v -> to_qkv, SwiGLU halves swapped) for the MLX runner. Values unchanged. "
@@ -168,18 +171,31 @@ def main(argv=None) -> int:
     if args.lora_only:
         return 0
 
+    decoder = root / "vae" / DECODER_NAME
+    decoder_ok = decoder.exists() and sha256_of(decoder) == DECODER_SHA256
+    if decoder.exists() and not decoder_ok:
+        print("decoder on disk does not match its sha256; building it again", flush=True)
+        decoder.unlink()
     files = dict(CORE_FILES)
+    if decoder_ok and not args.keep_source:
+        files.pop(VAE_SOURCE, None)   # already converted: never fetch the 5.6 GB original again
     if args.with_upsampler:
         files.update(UPSAMPLER_FILES)
     for rel, (size, sha) in files.items():
         fetch(DIFFUSERS_REPO, DIFFUSERS_REVISION, rel, root / rel, size, sha)
         print("ok", rel, flush=True)
 
-    decoder = root / "vae" / DECODER_NAME
-    if not decoder.exists():
+    if not decoder_ok:
         digest = convert_decoder(root / VAE_SOURCE, root / "vae" / "config.json", decoder)
+        if digest != DECODER_SHA256:
+            decoder.unlink()
+            print(f"error: the converted decoder's sha256 {digest[:12]} is not the expected {DECODER_SHA256[:12]}; "
+                  "removed it. Report this line.", file=sys.stderr, flush=True)
+            return 3
         (root / "vae" / (DECODER_NAME + ".sha256")).write_text(digest + "\n")
-        print("decoder converted", digest[:12], flush=True)
+        print("decoder converted", digest[:12], "sha256 verified", flush=True)
+    else:
+        print("decoder ok", DECODER_SHA256[:12], flush=True)
     if not args.keep_source and (root / VAE_SOURCE).exists():
         (root / VAE_SOURCE).unlink()
     return 0
