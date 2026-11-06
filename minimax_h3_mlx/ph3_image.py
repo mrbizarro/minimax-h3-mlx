@@ -85,6 +85,7 @@ def denoise_image(
     drop_adaln: bool = True,
     verbose: bool = True,
     on_step=None,
+    modulation_cache=None,
 ) -> mx.array:
     """Run the 8-forward loop. Returns normalised latents ``(1, C, 1, H', W')`` (float32)."""
     height, width = round_canvas(height, width)
@@ -118,7 +119,14 @@ def denoise_image(
             for d, inv in per_step]
     timestep_table = mx.array(np.array(table, dtype=np.float32))
 
-    cache = ModulationCache.build(dit, timestep_table, dtype=mx.bfloat16)
+    # A warm runner owns this table along with the model whose AdaLN weights were dropped.
+    # Rebuilding it on image two would otherwise read deleted projection weights.
+    cache_key = tuple(table)
+    cache = modulation_cache.get(cache_key) if modulation_cache is not None else None
+    if cache is None:
+        cache = ModulationCache.build(dit, timestep_table, dtype=mx.bfloat16)
+        if modulation_cache is not None:
+            modulation_cache[cache_key] = cache
     if drop_adaln:
         drop_adaln_weights(dit)
         mx.eval(dit.parameters())
@@ -149,28 +157,48 @@ def denoise_image(
 
 
 class PH3ImageRunner:
-    """Staged driver: encode -> (free encoder) -> DiT + adapter -> (free DiT) -> decode."""
+    """Staged by default; experimental ``keep_warm`` retains components until ``close``.
+
+    Warm residency is for a batch under one GPU lock. It has not been memory-qualified for
+    release, and must not persist after the caller hands the GPU to another engine.
+    """
 
     def __init__(self, root: str | Path, dit_path: str | Path, lora_path: str | Path | None,
-                 lora_scale: float = 1.0, lora_mode: str = "runtime"):
+                 lora_scale: float = 1.0, lora_mode: str = "runtime", keep_warm: bool = False):
         self.root, self.dit_path = Path(root), Path(dit_path)
         self.lora_path, self.lora_scale, self.lora_mode = lora_path, lora_scale, lora_mode
         self.metrics: dict = {}
+        self.keep_warm = keep_warm
+        self._encoder = self._dit = self._vae = None
+        self._modulation_cache = {}
+        self._lora_accounting = None
+
+    def close(self):
+        """Release all resident components before handing the GPU to another workload."""
+        self._encoder = self._dit = self._vae = None
+        self._modulation_cache.clear()
+        self._lora_accounting = None
+        gc.collect()
+        mx.clear_cache()
 
     def generate(self, prompt: str, width: int, height: int, seed: int = 0,
                  verbose: bool = True, drop_adaln: bool = True) -> np.ndarray:
         import json
 
-        from .lora import apply_loras, parse_spec
+        from .lora import apply_loras
         from .load import load_dit
         from .ph3_image_text import PH3ImageTextEncoder
         from .ph3_image_vae import decode_to_uint8, load_image_vae
 
-        m = self.metrics
+        m = self.metrics = {"warm_hit": self._dit is not None, "keep_warm": self.keep_warm}
         t0 = time.perf_counter()
 
         started = time.perf_counter()
-        encoder = PH3ImageTextEncoder(self.root, load_vision=False, verbose=False)
+        encoder = self._encoder
+        if encoder is None:
+            encoder = PH3ImageTextEncoder(self.root, load_vision=False, verbose=False)
+            if self.keep_warm:
+                self._encoder = encoder
         cond, tags = encoder.encode(prompt)
         mx.eval(cond)
         m["text_seconds"] = time.perf_counter() - started
@@ -180,17 +208,24 @@ class PH3ImageRunner:
         mx.clear_cache()
 
         started = time.perf_counter()
-        dit = load_dit(self.dit_path, verbose=verbose)
+        dit = self._dit
+        if dit is None:
+            dit = load_dit(self.dit_path, verbose=verbose)
         m["dit_load_seconds"] = time.perf_counter() - started
-        accounting = None
-        if self.lora_path:
+        started = time.perf_counter()
+        if self.lora_path and self._dit is None:
             reports = apply_loras(dit, [(Path(self.lora_path), float(self.lora_scale))],
                                   mode=self.lora_mode, verbose=verbose,
                                   permute_qkv=ADAPTER_QKV_PERMUTE, swap_fc1=ADAPTER_FC1_SWAP)
-            accounting = reports[0].summary()
-            m["lora"] = accounting
+            self._lora_accounting = reports[0].summary()
+        m["lora_seconds"] = time.perf_counter() - started
+        m["lora"] = self._lora_accounting
+        if self.keep_warm:
+            self._dit = dit
         started = time.perf_counter()
-        latents = denoise_image(dit, cond, tags, height, width, seed=seed, drop_adaln=drop_adaln, verbose=verbose)
+        latents = denoise_image(dit, cond, tags, height, width, seed=seed, drop_adaln=drop_adaln,
+                               verbose=verbose,
+                               modulation_cache=self._modulation_cache if self.keep_warm else None)
         mx.eval(latents)
         m["denoise_seconds"] = time.perf_counter() - started
         m["step_seconds"] = list(getattr(denoise_image, "last_step_seconds", []))
@@ -199,10 +234,15 @@ class PH3ImageRunner:
         mx.clear_cache()
 
         started = time.perf_counter()
-        vae = load_image_vae(self.root / "vae" / "decoder.safetensors",
-                             json.loads((self.root / "vae" / "config.json").read_text()))
+        vae = self._vae
+        if vae is None:
+            vae = load_image_vae(self.root / "vae" / "decoder.safetensors",
+                                 json.loads((self.root / "vae" / "config.json").read_text()))
+            if self.keep_warm:
+                self._vae = vae
         image = decode_to_uint8(vae, latents)
         m["decode_seconds"] = time.perf_counter() - started
         m["total_seconds"] = time.perf_counter() - t0
         m["peak_gb"] = mx.get_peak_memory() / 1e9
+        m["peak_scope"] = "process_lifetime"
         return image

@@ -50,6 +50,25 @@ class TestSchedule(unittest.TestCase):
 
 
 class TestTinyEndToEnd(unittest.TestCase):
+    def test_warm_modulation_survives_dropped_weights_and_changed_text_length(self):
+        cfg = replace(tiny_config(), latents_dim=24, rope_inv_freq_len=2)
+        mx.random.seed(0)
+        dit = MiniMaxH3DiT(cfg)
+        mx.eval(dit.parameters())
+        cond = mx.random.normal((1, 5, cfg.text_dim))
+        tags = np.ones(5, dtype=np.int64)
+        cache = {}
+        first = P.denoise_image(dit, cond, tags, 64, 64, seed=7, verbose=False,
+                                modulation_cache=cache)
+        second = P.denoise_image(dit, cond, tags, 64, 64, seed=7, verbose=False,
+                                 modulation_cache=cache)
+        self.assertEqual(float(mx.max(mx.abs(first - second)).item()), 0.0)
+        changed = P.denoise_image(dit, cond[:, :3], tags[:3], 64, 96, seed=8,
+                                  verbose=False, modulation_cache=cache)
+        self.assertEqual(changed.shape, (1, 24, 1, 4, 6))
+        self.assertTrue(bool(mx.all(mx.isfinite(changed)).item()))
+        self.assertEqual(len(cache), 1)
+
     def test_denoise_and_decode(self):
         # 16 px per latent token x 2 (patch) -> canvas must be a multiple of 32.
         cfg = replace(tiny_config(), latents_dim=24, rope_inv_freq_len=2)
