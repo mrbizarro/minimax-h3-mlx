@@ -157,21 +157,29 @@ def denoise_image(
 
 
 class PH3ImageRunner:
-    """Staged by default; experimental ``keep_warm`` retains components until ``close``.
+    """Staged by default; callers may retain the DiT or all components until ``close``.
 
-    Warm residency is for a batch under one GPU lock. It has not been memory-qualified for
-    release, and must not persist after the caller hands the GPU to another engine.
+    A persistent caller must serialize GPU requests and evict before another engine loads.
+    ``retain="dit"`` releases the text encoder and decoder after each request.
     """
 
     def __init__(self, root: str | Path, dit_path: str | Path, lora_path: str | Path | None,
-                 lora_scale: float = 1.0, lora_mode: str = "runtime", keep_warm: bool = False):
+                 lora_scale: float = 1.0, lora_mode: str = "runtime", keep_warm: bool = False,
+                 retain: str = "all", compile_blocks: bool = False):
         self.root, self.dit_path = Path(root), Path(dit_path)
         self.lora_path, self.lora_scale, self.lora_mode = lora_path, lora_scale, lora_mode
         self.metrics: dict = {}
-        self.keep_warm = keep_warm
+        if retain not in ("all", "dit"):
+            raise ValueError("retain must be all or dit")
+        self.keep_warm, self.retain = keep_warm, retain
+        self.compile_blocks = compile_blocks
         self._encoder = self._dit = self._vae = None
         self._modulation_cache = {}
         self._lora_accounting = None
+
+    def _denoise(self, dit, *args, **kwargs):
+        """Run one trajectory; subclasses may supply an alternate sampler."""
+        return denoise_image(dit, *args, **kwargs)
 
     def close(self):
         """Release all resident components before handing the GPU to another workload."""
@@ -190,14 +198,15 @@ class PH3ImageRunner:
         from .ph3_image_text import PH3ImageTextEncoder
         from .ph3_image_vae import decode_to_uint8, load_image_vae
 
-        m = self.metrics = {"warm_hit": self._dit is not None, "keep_warm": self.keep_warm}
+        m = self.metrics = {"warm_hit": self._dit is not None, "keep_warm": self.keep_warm,
+                            "retain": self.retain, "compile_blocks": self.compile_blocks}
         t0 = time.perf_counter()
 
         started = time.perf_counter()
         encoder = self._encoder
         if encoder is None:
             encoder = PH3ImageTextEncoder(self.root, load_vision=False, verbose=False)
-            if self.keep_warm:
+            if self.keep_warm and self.retain == "all":
                 self._encoder = encoder
         cond, tags = encoder.encode(prompt)
         mx.eval(cond)
@@ -222,13 +231,15 @@ class PH3ImageRunner:
         m["lora"] = self._lora_accounting
         if self.keep_warm:
             self._dit = dit
+        dit.compile_image_blocks = self.compile_blocks
         started = time.perf_counter()
-        latents = denoise_image(dit, cond, tags, height, width, seed=seed, drop_adaln=drop_adaln,
+        latents = self._denoise(dit, cond, tags, height, width, seed=seed, drop_adaln=drop_adaln,
                                verbose=verbose,
                                modulation_cache=self._modulation_cache if self.keep_warm else None)
         mx.eval(latents)
         m["denoise_seconds"] = time.perf_counter() - started
         m["step_seconds"] = list(getattr(denoise_image, "last_step_seconds", []))
+        m["forwards"] = len(m["step_seconds"])
         del dit
         gc.collect()
         mx.clear_cache()
@@ -238,7 +249,7 @@ class PH3ImageRunner:
         if vae is None:
             vae = load_image_vae(self.root / "vae" / "decoder.safetensors",
                                  json.loads((self.root / "vae" / "config.json").read_text()))
-            if self.keep_warm:
+            if self.keep_warm and self.retain == "all":
                 self._vae = vae
         image = decode_to_uint8(vae, latents)
         m["decode_seconds"] = time.perf_counter() - started

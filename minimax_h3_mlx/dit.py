@@ -302,6 +302,17 @@ class TransformerBlock(nn.Module):
         return x + gate_mlp[adaln_indices] * self.mlp(h)
 
 
+    def compiled_call(self, x, modulation, adaln_indices, rotary, mask=None):
+        """Compile the image block with live parameters; masked/video callers stay eager."""
+        if mask is not None:
+            return self(x, modulation, adaln_indices, rotary, mask)
+        fn = self.__dict__.get("_image_compiled")
+        if fn is None:
+            fn = mx.compile(lambda x, mod, idx, rot: self(x, mod, idx, rot), inputs=self.state)
+            object.__setattr__(self, "_image_compiled", fn)
+        return fn(x, modulation, adaln_indices, rotary)
+
+
 class MiniMaxH3DiT(nn.Module):
     """The MiniMax-H3 joint video + audio diffusion transformer.
 
@@ -471,7 +482,8 @@ class MiniMaxH3DiT(nn.Module):
             modulation = (
                 modulation_cache.get(i) if modulation_cache is not None else block.adaln_proj(temb)
             )
-            x = block(x, modulation, adaln_indices, rotary, mask)
+            call = block.compiled_call if getattr(self, "compile_image_blocks", False) else block
+            x = call(x, modulation, adaln_indices, rotary, mask)
 
         # 4. Both heads run over every row, then each modality's rows are selected.
         x = self.final_layer.norm_out(x, temb, timestep_indices)
