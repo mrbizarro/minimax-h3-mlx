@@ -96,6 +96,7 @@ def load_dit(
     dtype: mx.Dtype | None = None,
     strict: bool = True,
     verbose: bool = False,
+    stream=None,
 ) -> MiniMaxH3DiT:
     """Load the 33B DiT from a released ``FL2VA/transformer`` (or ``Ref2VA/transformer``) directory.
 
@@ -105,6 +106,9 @@ def load_dit(
             mixed float32/bfloat16 split, which is what the reference runs.
         strict: raise if the checkpoint and the module tree disagree on any key.
         verbose: print per-shard progress.
+        stream: a :class:`~minimax_h3_mlx.dit_stream.StreamPolicy`. The block linears it
+            streams are never read here; the returned model carries a ``streamer`` that loads
+            them per block during the forward (low-memory Macs). ``None`` = fully resident.
 
     Returns:
         A parameter-loaded :class:`MiniMaxH3DiT`.
@@ -151,11 +155,39 @@ def load_dit(
     weights: dict[str, mx.array] = {}
     unexpected: list[str] = []
 
+    stream_plan = None
+    streamed_keys: set[str] = set()
+    if stream is not None:
+        if dtype is not None:
+            raise ValueError("a streamed DiT keeps the checkpoint's dtypes (dtype must be None)")
+        from .dit_stream import plan_streamed
+        from .tensor_stream import tensor_index
+
+        stream_plan, stream = plan_streamed(
+            tensor_index(shard_paths(model_dir)), config.num_layers, stream)
+        streamed_keys = {
+            f"blocks.{block}.{part}.{param}"
+            for block, items in stream_plan.items() for part, param, _ in items
+        }
+        # The constructed tree holds lazy random-init (and quantize) graphs for these; they must
+        # go before `mx.eval(model.parameters())` or the load would materialize them.
+        for key in streamed_keys:
+            module_path, _, param = key.rpartition(".")
+            module = model
+            for name in module_path.split("."):
+                module = module[int(name)] if name.isdigit() else getattr(module, name)
+            if param in module:
+                delattr(module, param)
+        missing_streamed = streamed_keys - expected
+        if missing_streamed:
+            raise KeyError(f"streamed tensors not in the module tree: {sorted(missing_streamed)[:4]}")
+        expected -= streamed_keys
+
     for shard in shard_paths(model_dir):
         started = time.perf_counter()
         loaded = mx.load(str(shard))
         for key, tensor in loaded.items():
-            if key in SKIP_KEYS:
+            if key in SKIP_KEYS or key in streamed_keys:
                 continue
             if key not in expected:
                 unexpected.append(key)
@@ -186,6 +218,16 @@ def load_dit(
 
     model.update(tree_unflatten(list(weights.items())))
     mx.eval(model.parameters())
+    if stream_plan is not None:
+        from .dit_stream import BlockStreamer
+
+        model.streamer = BlockStreamer(model, stream_plan, stream)
+        if verbose:
+            info = model.streamer.summary()
+            print(f"  streamed DiT: {info['streamed_blocks']} blocks stream "
+                  f"({info['streamed_gib_per_forward']:.2f} GiB per forward, "
+                  f"{info['slots']} slots x {info['slot_gib']:.3f} GiB), "
+                  f"{len(info['resident_blocks'])} resident, policy {info['policy']}")
     return model
 
 
@@ -260,9 +302,9 @@ def load_video_vae(model_dir: str | Path, strict: bool = True):
     return model
 
 
-def load_compact_video_vae(path: str | Path, strict: bool = True):
-    """Load ddalcu's self-describing single-file video VAE export."""
-    from .video_vae import VideoVAE, VideoVAEConfig
+def load_compact_video_vae_config(path: str | Path):
+    """The ``VideoVAEConfig`` stored in ddalcu's single-file video VAE export's metadata."""
+    from .video_vae import VideoVAEConfig
 
     path = Path(path)
     wrapper = _metadata_json(safetensor_metadata(path), "minimax_h3_video_vae")
@@ -286,6 +328,15 @@ def load_compact_video_vae(path: str | Path, strict: bool = True):
         latents_mean=tuple(wrapper["latents_mean"]),
         latents_std=tuple(wrapper["latents_std"]),
     )
+    return config
+
+
+def load_compact_video_vae(path: str | Path, strict: bool = True):
+    """Load ddalcu's self-describing single-file video VAE export."""
+    from .video_vae import VideoVAE
+
+    path = Path(path)
+    config = load_compact_video_vae_config(path)
     model = VideoVAE(config)
     expected = {key for key, _ in tree_flatten(model.parameters())}
     weights: dict[str, mx.array] = {}

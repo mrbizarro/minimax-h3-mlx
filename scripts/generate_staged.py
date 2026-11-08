@@ -241,6 +241,17 @@ def row_timestep_plan(layout, video_timesteps, audio_timesteps, frozen_video=Non
     return mx.array(np.array(table, dtype=np.float32)), plan
 
 
+def load_encode_vae(args):
+    """The video VAE for an encode (keyframes, references, carried frames). Low-memory renders
+    load only its CNN encoder: the 4.5 GiB ViT decoder is never run by an encode."""
+    path = args.compact_root / "video_vae.safetensors"
+    if getattr(args, "stream_vae_decoder", False):
+        from minimax_h3_mlx.vae_stream import load_compact_video_vae_encoder_only
+
+        return load_compact_video_vae_encoder_only(path)
+    return load_compact_video_vae(path)
+
+
 def decode_video(model, rows, frames: int, latent_frames: int, latent_h: int, latent_w: int, patch):
     cfg = model.config
     latents = unpatchify_video_tokens(
@@ -1008,8 +1019,13 @@ def render_window(
                 load_vision=bool(vision_images),
                 verbose=True,
                 config_path=args.text_config,
+                # Low-memory mode: one embedding/decoder/vision unit resident at a time instead
+                # of the whole ~25.8 GiB conditioner. Same modules, dtypes and order.
+                stream=bool(getattr(args, "stream_text_encoder", False)),
             )
             embeds, text_tags = encoder.encode(prompt, vision_images or None)
+            if getattr(encoder, "stream_stats", None):
+                record.data[f"{label}text_encoder_stream"] = encoder.stream_stats
             embeds = mx.array(embeds)
             mx.eval(embeds)
             if prompt_cache is not None:
@@ -1080,7 +1096,7 @@ def render_window(
                 record.data[f"{label}keyframe_cache_hit"] = True
         else:
             with record.phase(f"{label}keyframe_encode"):
-                keyframe_vae = load_compact_video_vae(args.compact_root / "video_vae.safetensors")
+                keyframe_vae = load_encode_vae(args)
                 condition_rows = encode_keyframe_rows(
                     keyframe_vae, keyframes, args.height, args.width, patch
                 )
@@ -1099,7 +1115,7 @@ def render_window(
     reference_grids: tuple = ()
     if cond.references:
         with record.phase(f"{label}reference_encode"):
-            ref_vae = load_compact_video_vae(args.compact_root / "video_vae.safetensors")
+            ref_vae = load_encode_vae(args)
             parts, grids = [], []
             for image in cond.references:
                 w_ref, h_ref = image.size
@@ -1119,7 +1135,7 @@ def render_window(
     frozen_video_rows = None
     if cond.history_frames is not None or cond.frozen_frames is not None:
         with record.phase(f"{label}media_encode"):
-            media_vae = load_compact_video_vae(args.compact_root / "video_vae.safetensors")
+            media_vae = load_encode_vae(args)
             if cond.history_frames is not None:
                 history_rows = encode_video_rows(
                     media_vae, cond.history_frames, patch, sample=True
@@ -1176,8 +1192,22 @@ def render_window(
     # metrics file can no longer claim bf16 for a Q8 render.
     precision = dit_precision(args.dit)
     record.data[f"{label}dit_precision"] = precision
+    stream_policy = None
+    if getattr(args, "stream_dit", False):
+        from minimax_h3_mlx.dit_stream import StreamPolicy
+
+        stream_policy = StreamPolicy.parse(
+            getattr(args, "dit_resident", "none"),
+            prefetch=max(0, int(getattr(args, "dit_prefetch", 1))),
+            workers=max(1, int(getattr(args, "dit_stream_workers", 4))),
+            nocache=not getattr(args, "dit_stream_page_cache", False),
+            pipeline=bool(getattr(args, "dit_pipeline", False)),
+        )
+        if getattr(args, "lora_mode", "runtime") == "fuse":
+            raise SystemExit("--stream-dit needs --lora-mode runtime (a fused adapter would be "
+                             "overwritten by the next block read)")
     with record.phase(f"{label}dit_load_{precision}"):
-        dit = load_dit(args.dit, verbose=True)
+        dit = load_dit(args.dit, verbose=True, stream=stream_policy)
         patch = dit.config.patch_size
         lora_spec = getattr(args, "lora", None)
         lora_specs = [lora_spec] if isinstance(lora_spec, (str, Path)) else list(lora_spec or [])
@@ -1199,6 +1229,12 @@ def render_window(
                 record.data[f"{label}lora"] = reports[0].summary()
                 if len(reports) > 1:
                     record.data[f"{label}lora_stack"] = [r.summary() for r in reports]
+                if getattr(dit, "streamer", None) is not None:
+                    # The adapter factors of streamed blocks stream with them when they are the
+                    # file's bytes verbatim (no permute / swap / dtype promotion).
+                    adapters = dit.streamer.stream_adapters(transformed=bool(
+                        getattr(args, "lora_qkv_permute", False) or getattr(args, "lora_fc1_swap", False)))
+                    print(f"  streamed DiT adapters: {adapters}", flush=True)
             else:
                 record.data[f"{label}lora"] = {
                     "path": str(lora_stack[0][0]),
@@ -1661,48 +1697,106 @@ def render_window(
             print(f"stage-A cache: {stage_a_cache}", flush=True)
             for name, value in stored["digests"].items():
                 print(f"  {name} {tuple(stored['shapes'][name])} sha256 {value[:16]}", flush=True)
+    streamer = getattr(dit, "streamer", None)
+    if streamer is not None:
+        streamer.close()
+        record.data[f"{label}dit_stream"] = streamer.summary()
+        record.flush()
+        info = record.data[f"{label}dit_stream"]
+        print(f"DiT stream: {info['blocks_loaded']} block loads, {info['gib_read']:.1f} GiB read in "
+              f"{info['read_seconds']:.1f}s of worker time, main thread waited "
+              f"{info['wait_seconds']:.2f}s (max {info['max_wait_seconds']:.2f}s)", flush=True)
+        dit.streamer = None
+        del streamer
     del dit, cache, plan, timestep_table, video_sched, audio_sched
     release()
 
-    if not cond.decode_video:
-        # Video-to-audio: the picture was held, so the delivery is the supplied pixels.
-        video = np.asarray(cond.frozen_frames[:frames], dtype=np.uint8)
-        del video_rows
-    elif getattr(args, "draft_decode", "full") == "tae":
-        with record.phase(f"{label}video_tae_decode"):
-            from minimax_h3_mlx.tiny_video_vae import load_tiny_h3_video_decoder
+    decode_cache = getattr(args, "decode_cache_gb", None)
+    previous_cache_limit = None
+    if decode_cache is not None:
+        # Low-RAM: after a streamed denoise the run peak is the decode, and most of the process
+        # footprint there is MLX's cache of freed buffers. Capped for the decode only, restored
+        # after, so the denoise (and a chain's next window) keeps its allocator reuse.
+        previous_cache_limit = mx.set_cache_limit(int(max(0.0, decode_cache) * 1024**3))
+    try:
+        if not cond.decode_video:
+            # Video-to-audio: the picture was held, so the delivery is the supplied pixels.
+            video = np.asarray(cond.frozen_frames[:frames], dtype=np.uint8)
+            del video_rows
+        elif getattr(args, "draft_decode", "full") == "tae":
+            with record.phase(f"{label}video_tae_decode"):
+                from minimax_h3_mlx.tiny_video_vae import load_tiny_h3_video_decoder
 
-            video_tae = load_tiny_h3_video_decoder(args.tae_checkpoint)
-            video = decode_video_tae(
-                video_tae, video_rows[n_cond_v:], frames, latent_frames, latent_h, latent_w, patch
-            )
-        del video_tae, video_rows
-    else:
-        # This is the dense/HQ path. Keep it isolated from preview changes: release validation
-        # hashes this exact decoder's video stream against a pre-branch render.
-        with record.phase(f"{label}video_vae_decode"):
-            video_vae = load_compact_video_vae(args.compact_root / "video_vae.safetensors")
-            video = decode_video(
-                video_vae, video_rows[n_cond_v:], frames, latent_frames, latent_h, latent_w, patch
-            )
-        del video_vae, video_rows
-    release()
-    if cond.decode_video:
-        check_decoded_video(video, lora_stack)
+                video_tae = load_tiny_h3_video_decoder(args.tae_checkpoint)
+                video = decode_video_tae(
+                    video_tae, video_rows[n_cond_v:], frames, latent_frames, latent_h, latent_w, patch
+                )
+            del video_tae, video_rows
+        else:
+            # This is the dense/HQ path. Keep it isolated from preview changes: release validation
+            # hashes this exact decoder's video stream against a pre-branch render.
+            with record.phase(f"{label}video_vae_decode"):
+                vae_stream = None
+                if getattr(args, "stream_vae_decoder", False):
+                    # Low-memory: the ViT decoder's 36 blocks stream from the file, two resident;
+                    # the CNN encoder (keyframes only) is not loaded. Same pixels.
+                    from minimax_h3_mlx.vae_stream import load_compact_video_vae_streamed
 
-    with record.phase(f"{label}audio_vae_decode"):
-        audio_vae = load_compact_audio_vae(args.compact_root / "audio_vae.safetensors")
-        audio = decode_audio(audio_vae, audio_rows[n_cond_a:], audio_latents, frames)
-        sample_rate = audio_vae.config.sampling_rate
-        if adapter_audio_rows is not None:
-            original = decode_audio(audio_vae, adapter_audio_rows[n_cond_a:], audio_latents, frames)
-            keep = args.output.with_name(f"{args.output.stem}_{label}adapter_audio.wav")
-            keep.parent.mkdir(parents=True, exist_ok=True)
-            write_wav(keep, original, int(sample_rate))
-            record.data[f"{label}revoice"]["adapter_audio"] = str(keep)
-            del original
-    del audio_vae, audio_rows, embeds, layout, adapter_audio_rows
-    release()
+                    video_vae, vae_stream = load_compact_video_vae_streamed(
+                        args.compact_root / "video_vae.safetensors")
+                else:
+                    video_vae = load_compact_video_vae(args.compact_root / "video_vae.safetensors")
+                try:
+                    video = decode_video(
+                        video_vae, video_rows[n_cond_v:], frames, latent_frames, latent_h, latent_w,
+                        patch
+                    )
+                except RuntimeError as exc:
+                    # Low-memory only: a finished denoise must not die in the decode. Tiles are
+                    # decoded independently, so one tile per call is the same arithmetic in the
+                    # least memory; MLX refuses an allocation with a RuntimeError before Metal
+                    # does, which is the case this catches.
+                    text = str(exc).lower()
+                    if (getattr(args, "low_memory", "off") == "off" or video_vae.decode_batch <= 1
+                            or not any(w in text for w in ("allocat", "memory", "malloc"))):
+                        raise
+                    print(f"video decode ran out of memory at {video_vae.decode_batch} tiles per "
+                          "call; retrying one tile at a time", flush=True)
+                    record.data[f"{label}decode_retry"] = {"from_batch": video_vae.decode_batch,
+                                                           "error": str(exc)[:200]}
+                    mx.clear_cache()
+                    video_vae.decode_batch = 1
+                    video = decode_video(
+                        video_vae, video_rows[n_cond_v:], frames, latent_frames, latent_h, latent_w,
+                        patch
+                    )
+                finally:
+                    if vae_stream is not None:
+                        record.data[f"{label}vae_stream"] = vae_stream.summary()
+                        vae_stream.close()
+            del video_vae, video_rows
+        release()
+        if cond.decode_video:
+            check_decoded_video(video, lora_stack)
+
+        with record.phase(f"{label}audio_vae_decode"):
+            audio_vae = load_compact_audio_vae(args.compact_root / "audio_vae.safetensors")
+            audio = decode_audio(audio_vae, audio_rows[n_cond_a:], audio_latents, frames)
+            sample_rate = audio_vae.config.sampling_rate
+            if adapter_audio_rows is not None:
+                original = decode_audio(audio_vae, adapter_audio_rows[n_cond_a:], audio_latents, frames)
+                keep = args.output.with_name(f"{args.output.stem}_{label}adapter_audio.wav")
+                keep.parent.mkdir(parents=True, exist_ok=True)
+                write_wav(keep, original, int(sample_rate))
+                record.data[f"{label}revoice"]["adapter_audio"] = str(keep)
+                del original
+        del audio_vae, audio_rows, embeds, layout, adapter_audio_rows
+        release()
+    finally:
+        # Restored on every path (v2a, TAE, a failed decode or integrity check), so later work in
+        # this process never inherits the decode cap.
+        if previous_cache_limit is not None:
+            mx.set_cache_limit(previous_cache_limit)
 
     record.data[f"{label}mean_denoise_step_seconds"] = round(float(np.mean(step_times)), 3)
     record.data[f"{label}denoise_step_seconds"] = [round(value, 3) for value in step_times]
@@ -2105,8 +2199,87 @@ def main() -> int:
         "decode, bit for bit. float16 matches the reference's FP16 autocast.",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--cache-gb",
+        type=float,
+        default=None,
+        metavar="GB",
+        help="cap MLX's buffer cache (freed buffers kept for reuse). Unset = MLX's default "
+        "(the memory limit). On a streamed low-RAM run the cache, not live arrays, is most of "
+        "the process footprint; a cap changes no output.",
+    )
+    parser.add_argument(
+        "--decode-cache-gb",
+        type=float,
+        default=None,
+        metavar="GB",
+        help="cap MLX's buffer cache for the VAE decodes only (restored after). Low-RAM Macs: "
+        "the decode is the run peak once the DiT streams. Changes no output.",
+    )
     parser.add_argument("--wired-gb", type=float, default=50.0)
     parser.add_argument("--memory-gb", type=float, default=58.0)
+    parser.add_argument(
+        "--low-memory",
+        choices=("off", "auto", "on"),
+        default="off",
+        help="EXPERIMENTAL (exp/h3-24gb). off (default): today's path, every argument as given. "
+        "auto: keep today's path when its estimated largest pass fits this Mac's budget, "
+        "otherwise stream the prompt encoder and the DiT, cap MLX's buffer cache and size the "
+        "decode tiles to fit. on: always the low-memory settings. Either of the last two also "
+        "checks, before anything loads, that the largest pass fits (exit 76: this Mac cannot; "
+        "exit 77: other apps leave too little free right now).",
+    )
+    parser.add_argument(
+        "--stream-vae-decoder",
+        action="store_true",
+        help="EXPERIMENTAL low-RAM: stream the video VAE's ViT decoder one block at a time (two "
+        "of 36 resident, the next read while the current computes) and skip its CNN encoder in "
+        "the decode. Same pixels; the decode holds ~0.3 GiB of weights instead of 4.85.",
+    )
+    parser.add_argument(
+        "--admission-only",
+        action="store_true",
+        help="print the memory plan and admission verdict (one H3_ADMISSION JSON line) and exit "
+        "without loading any model: 0 = would start, 76 = cannot fit this Mac, 77 = busy now",
+    )
+    parser.add_argument(
+        "--stream-text-encoder",
+        action="store_true",
+        help="Low-memory mode: stream the text/vision conditioner one unit at a time from the "
+        "safetensors byte ranges (embedding, each decoder layer, each vision block) instead of "
+        "holding all of it resident. Output conditioning is unchanged; the encode phase peaks "
+        "at about one unit instead of the whole encoder.",
+    )
+    parser.add_argument(
+        "--stream-dit",
+        action="store_true",
+        help="Low-memory mode: stream the DiT block weights from the safetensors shards per forward "
+        "(direct reads into a fixed pool of block slots, the next block prefetched while the "
+        "current one computes) instead of holding all 50 blocks resident. Same bytes, same "
+        "kernels; the denoise holds the non-block weights plus --dit-prefetch + 1 blocks.",
+    )
+    parser.add_argument(
+        "--dit-resident",
+        default="none",
+        metavar="SPEC",
+        help="with --stream-dit: what stays resident. 'none', or a comma list of parts kept in "
+        "every block (qkv,out,fc1,fc2), 'first:K' / 'blocks:A-B' whole blocks, 'gb:X' as many "
+        "whole blocks as fit in X GiB.",
+    )
+    parser.add_argument("--dit-prefetch", type=int, default=1, metavar="N",
+                        help="with --stream-dit: blocks read ahead of the one computing")
+    parser.add_argument("--dit-pipeline", action="store_true",
+                        help="with --stream-dit: queue each block before confirming the previous "
+                        "one (one more slot), so the GPU does not idle while the host builds the "
+                        "next block")
+    parser.add_argument("--dit-stream-workers", type=int, default=4, metavar="N",
+                        help="with --stream-dit: concurrent tensor reads")
+    parser.add_argument(
+        "--dit-stream-page-cache",
+        action="store_true",
+        help="with --stream-dit: read through the page cache (default bypasses it with "
+        "F_NOCACHE, so streamed weights leave no residue in RAM)",
+    )
     parser.add_argument(
         "--step-cache",
         type=float,
@@ -2423,6 +2596,28 @@ def main() -> int:
         )
 
     device = mx.device_info()
+    memory_plan = None
+    if args.low_memory != "off" or args.admission_only:
+        # Decided before anything large loads; `off` never reaches here, so today's path is
+        # untouched unless a caller opts in.
+        from minimax_h3_mlx.memory_plan import EXIT_BUSY, EXIT_CANNOT, plan_for_request
+
+        memory_plan = plan_for_request(args, device, frames, chain, window_keyframes, prompts)
+        verdict = memory_plan["admission"]["verdict"]
+        print("H3_ADMISSION " + json.dumps(memory_plan, separators=(",", ":")), flush=True)
+        print(f"memory plan: {memory_plan['mode']} (asked {args.low_memory}), largest pass "
+              f"{memory_plan['peak_pass']} ~{memory_plan['peak_gib']:.1f} GiB of a "
+              f"{memory_plan['budget_gib']:.1f} GiB budget; verdict {verdict}", flush=True)
+        if verdict != "ok":
+            print(memory_plan["admission"]["message"], flush=True)
+            if args.metrics is not None:
+                args.metrics.parent.mkdir(parents=True, exist_ok=True)
+                args.metrics.write_text(json.dumps(
+                    {"status": "refused", "memory_plan": memory_plan}, indent=2))
+        if args.admission_only:
+            return {"ok": 0, "cannot": EXIT_CANNOT, "busy": EXIT_BUSY}[verdict]
+        if verdict != "ok":
+            return EXIT_CANNOT if verdict == "cannot" else EXIT_BUSY
     max_wired = int(device["max_recommended_working_set_size"])
     wired_bytes = min(int(args.wired_gb * 1024**3), max_wired - 1024**2)
     memory_bytes = min(int(args.memory_gb * 1024**3), int(device["memory_size"]) - 1024**3)
@@ -2501,7 +2696,19 @@ def main() -> int:
         # Which video-VAE decode mode produced this run, so a metrics file is self-describing
         # when someone compares decode phases across the campaign. 0/1 is the per-tile loop.
         "vae_decode_dtype": resolved_decode_dtype(),
+        "stream_text_encoder": bool(args.stream_text_encoder),
+        "stream_dit": bool(args.stream_dit),
+        "dit_resident": args.dit_resident if args.stream_dit else None,
+        "dit_prefetch": int(args.dit_prefetch) if args.stream_dit else None,
+        "dit_stream_workers": int(args.dit_stream_workers) if args.stream_dit else None,
+        "dit_stream_nocache": (not args.dit_stream_page_cache) if args.stream_dit else None,
+        "dit_pipeline": bool(args.dit_pipeline) if args.stream_dit else None,
         "vae_decode_batch": resolved_decode_batch(),
+        "cache_limit_gb": args.cache_gb,
+        "decode_cache_limit_gb": args.decode_cache_gb,
+        "low_memory": args.low_memory,
+        "stream_vae_decoder": bool(getattr(args, "stream_vae_decoder", False)),
+        "memory_plan": memory_plan,
         "wired_gb": round(gb(wired_bytes), 3),
         "memory_limit_gb": round(gb(memory_bytes), 3),
         "device": device,
@@ -2510,6 +2717,8 @@ def main() -> int:
     total_started = time.perf_counter()
     mx.set_wired_limit(wired_bytes)
     mx.set_memory_limit(memory_bytes)
+    if args.cache_gb is not None:
+        mx.set_cache_limit(int(max(0.0, args.cache_gb) * 1024**3))
 
     live_preview = None
     if args.live_preview != "off":

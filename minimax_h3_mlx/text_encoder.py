@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import glob
 import json
+import os
+from functools import partial
 from pathlib import Path
 
 import mlx.core as mx
@@ -46,6 +48,7 @@ class MiniMaxH3TextEncoder:
         verbose: bool = False,
         config_path: str | Path | None = None,
         taps: tuple[int, ...] | None = None,
+        stream: bool = False,
     ):
         from mlx_vlm.models.qwen3_vl.config import ModelConfig, TextConfig, VisionConfig
         from mlx_vlm.models.qwen3_vl.language import Qwen3VLModel
@@ -70,6 +73,7 @@ class MiniMaxH3TextEncoder:
         self.num_layers = num_layers
         self.full_layers = full_layers
         self.dtype = dtype
+        self.stream = stream
 
         text_raw = _legacy_rope(dict(raw["text_config"]))
         text_raw["num_hidden_layers"] = num_layers  # build only what we evaluate
@@ -88,7 +92,10 @@ class MiniMaxH3TextEncoder:
 
         self.language = Qwen3VLModel(self.text_config)
         self.vision = VisionModel(self.vision_config) if load_vision else None
-        self._load_weights(model_dir, dtype, verbose)
+        if stream:
+            self._stream_weights(model_dir, verbose)
+        else:
+            self._load_weights(model_dir, dtype, verbose)
 
         self.image_token_id = raw["image_token_id"]
         self.vision_start_token_id = raw["vision_start_token_id"]
@@ -100,6 +107,82 @@ class MiniMaxH3TextEncoder:
         self._model_dir = model_dir
 
     # -- loading ---------------------------------------------------------------------------
+
+    def _stream_weights(self, model_dir: Path, verbose: bool) -> None:
+        """Replace weight-bearing units with load/evaluate/release calls.
+
+        Keep mlx-vlm's actual forward methods, including the vision tower's
+        positional interpolation and deepstack merges. Only evaluation boundaries
+        change. No parameter from a completed unit is retained by a proxy.
+        """
+        from mlx_vlm.models.qwen3_vl.language import Qwen3VLDecoderLayer
+        from mlx_vlm.models.qwen3_vl.vision import PatchEmbed, PatchMerger, Qwen3VLMoEVisionBlock
+
+        from .tensor_stream import tensor_index
+
+        compact = model_dir / "text_encoder.safetensors"
+        shards = [compact] if compact.exists() else sorted(
+            p for p in model_dir.glob("*.safetensors") if not p.name.startswith(".")
+        )
+        if not shards:
+            raise FileNotFoundError(f"No safetensors in {model_dir}.")
+        index = tensor_index(shards)
+        weights = {}
+        self.skipped_tensors = 0
+        for key, entry in index.items():
+            target = self._wanted(key)
+            if target is None:
+                self.skipped_tensors += 1
+            else:
+                name = ".".join(target)
+                if name in weights:
+                    raise ValueError(f"Duplicate encoder parameter {name}")
+                weights[name] = entry
+        loader = _StreamedWeights(weights, self.dtype, verbose)
+        cfg = self.text_config
+        # The token table is the encoder's largest unit (151,936 x 5,120 BF16 = 1.45 GiB) and a
+        # prompt touches a few hundred of its rows: read only those rows.
+        self.language.embed_tokens = _StreamedEmbedding(
+            loader, "language.embed_tokens",
+            _StreamedUnit(loader, "language.embed_tokens",
+                          partial(nn.Embedding, cfg.vocab_size, cfg.hidden_size)),
+        )
+        layers = []
+        for i, layer in enumerate(self.language.layers):
+            unit = _StreamedUnit(loader, f"language.layers.{i}", partial(Qwen3VLDecoderLayer, cfg, i))
+            # _hidden_states reads only this weight-free object before entering
+            # the loop, to compute exactly the same shared M-RoPE embeddings.
+            unit.self_attn = nn.Module()
+            unit.self_attn.rotary_emb = layer.self_attn.rotary_emb
+            layers.append(unit)
+        self.language.layers = layers
+        # Execution order of the decoder layers, so each one can read the next one's bytes while
+        # it computes (a host copy of one unit, about 0.4 GiB).
+        loader.order = ["language.embed_tokens"] + [f"language.layers.{i}" for i in range(len(layers))]
+        self._stream_loader = loader
+        if self.vision is not None:
+            cfg = self.vision_config
+            self.vision.patch_embed = _StreamedUnit(
+                loader, "vision.patch_embed",
+                partial(PatchEmbed, cfg.patch_size, cfg.temporal_patch_size, cfg.in_channels, cfg.hidden_size),
+                # sanitize uses key names, so apply it before removing the unit prefix.
+                sanitize=partial(type(self.vision).sanitize, self.vision),
+            )
+            # The positional table is small and its dtype is inspected by the
+            # upstream forward. Load it normally; all blocks and mergers stream.
+            self.vision.pos_embed = loader.load("vision.pos_embed", self.vision.pos_embed)
+            self.vision.blocks = [
+                _StreamedUnit(loader, f"vision.blocks.{i}", partial(Qwen3VLMoEVisionBlock, cfg))
+                for i in range(cfg.depth)
+            ]
+            self.vision.merger = _StreamedUnit(
+                loader, "vision.merger", partial(PatchMerger, cfg, use_postshuffle_norm=False)
+            )
+            self.vision.deepstack_merger_list = [
+                _StreamedUnit(loader, f"vision.deepstack_merger_list.{i}",
+                              partial(PatchMerger, cfg, use_postshuffle_norm=True))
+                for i in range(len(cfg.deepstack_visual_indexes))
+            ]
 
     def _wanted(self, key: str) -> tuple[str, str] | None:
         """Map a checkpoint key onto this module's parameter path, or ``None`` to skip it."""
@@ -403,12 +486,189 @@ class MiniMaxH3TextEncoder:
             deepstack_visual_embeds=deepstack_embeds,
         )
         mx.eval(hidden_states)
+        loader = getattr(self, "_stream_loader", None)
+        if loader is not None:
+            self.stream_stats = dict(loader.stats)
+            loader.close()
         return hidden_states, token_tags
 
     # `LanguageModel.get_rope_index` reads `self.config`; expose the same attribute.
     @property
     def config(self):
         return self.model_config
+
+
+class _StreamedWeights:
+    """A header-only index shared by the streaming units (never a tensor cache)."""
+
+    def __init__(self, index, dtype, verbose):
+        self.index = index
+        self.dtype = dtype
+        self.verbose = verbose
+        #: Units in the order the forward calls them; ``load`` reads the next one ahead.
+        self.order: list[str] = []
+        self._ahead = None          # (prefix, Future -> {key: numpy array})
+        self._pool = None
+        self.stats = {"units": 0, "read_ahead_hits": 0, "wait_seconds": 0.0}
+
+    def _entries(self, prefix):
+        return {k[len(prefix) + 1:]: v for k, v in self.index.items() if k.startswith(prefix + ".")}
+
+    def _read_ahead(self, prefix):
+        """Start reading the unit after ``prefix`` on a worker thread (numpy only, no MLX)."""
+        if prefix not in self.order or os.environ.get("H3_TE_READ_AHEAD", "1") == "0":
+            return
+        i = self.order.index(prefix) + 1
+        if i >= len(self.order):
+            return
+        nxt = self.order[i]
+        if self._ahead is not None and self._ahead[0] == nxt:
+            return
+        if self._pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="te-read")
+        entries = self._entries(nxt)
+        self._ahead = (nxt, self._pool.submit(lambda: {k: v.numpy() for k, v in entries.items()}))
+
+    def _host(self, prefix):
+        """Raw host arrays for ``prefix``: the read-ahead result when it is this unit."""
+        import time as _time
+
+        if self._ahead is not None and self._ahead[0] == prefix:
+            started = _time.perf_counter()
+            arrays = self._ahead[1].result()
+            self.stats["wait_seconds"] += _time.perf_counter() - started
+            self.stats["read_ahead_hits"] += 1
+            self._ahead = None
+            return arrays
+        # A read for another unit stays queued: it is usually the one after this.
+        return None
+
+    def close(self):
+        if self._pool is not None:
+            self._pool.shutdown(wait=True)
+            self._pool = None
+        self._ahead = None
+
+    def load(self, prefix, module, sanitize=None):
+        from mlx.utils import tree_flatten, tree_unflatten
+
+        entries = {k[len(prefix) + 1:]: v for k, v in self.index.items() if k.startswith(prefix + ".")}
+        targets = {k[:-len(".scales")] for k in entries if k.endswith(".scales")}
+        # A container also lets nn.quantize replace a root Embedding/Linear.
+        box = nn.Module()
+        box.unit = module
+        nn.quantize(
+            box, group_size=64, bits=8, mode="affine",
+            class_predicate=lambda path, _: path.removeprefix("unit.") in targets
+            or (path == "unit" and "scales" in entries),
+        )
+        module = box.unit
+        expected = {k for k, _ in tree_flatten(module.parameters())}
+        missing = expected - entries.keys()
+        if missing:
+            raise KeyError(f"{prefix} missing {len(missing)} tensors, e.g. {sorted(missing)[:4]}")
+        host = self._host(prefix)
+        self._read_ahead(prefix)
+        self.stats["units"] += 1
+        weights = {}
+        for key in sorted(expected):
+            if host is not None and key in host:
+                raw = mx.array(host.pop(key))
+                tensor = raw.view(mx.bfloat16) if entries[key].dtype == "BF16" else raw
+            else:
+                tensor = entries[key].mlx()
+            weights[key] = tensor if tensor.dtype == mx.uint32 else tensor.astype(self.dtype)
+            # Finish the cast before reading the next tensor, bounding host copies too.
+            mx.eval(weights[key])
+        del host
+        if sanitize is not None:
+            # VisionModel.sanitize recognizes full vision-relative parameter names.
+            local_prefix = prefix.split(".", 1)[1] + "."
+            weights = {k[len(local_prefix):]: v for k, v in sanitize(
+                {local_prefix + k: v for k, v in weights.items()}
+            ).items()}
+        shapes = {k: v.shape for k, v in tree_flatten(module.parameters())}
+        for key, value in weights.items():
+            if value.shape != shapes[key]:
+                raise ValueError(f"{prefix}.{key}: expected {shapes[key]}, got {value.shape}")
+        module.update(tree_unflatten(list(weights.items())))
+        mx.eval(module.parameters())
+        if self.verbose:
+            print(f"  stream {prefix}: {sum(v.nbytes for v in weights.values()) / 1024**2:.1f} MiB", flush=True)
+        return module
+
+
+class _StreamedEmbedding(nn.Module):
+    """Token lookup that reads only the requested rows of an unquantized table.
+
+    ``nn.Embedding`` is ``weight[ids]``; reading the same rows' bytes and casting them the same
+    way gives the same values without holding (or reading) the other 151k rows. A quantized
+    table falls back to the whole-unit stream.
+    """
+
+    def __init__(self, loader, prefix, fallback):
+        super().__init__()
+        self._loader = loader
+        self._prefix = prefix
+        self._fallback = fallback
+
+    def __call__(self, ids):
+        from .tensor_stream import _DTYPES
+
+        index = self._loader.index
+        entry = index.get(self._prefix + ".weight")
+        if entry is None or (self._prefix + ".scales") in index or len(entry.shape) != 2:
+            return self._fallback(ids)
+        # Layer 0's bytes start arriving while the rows are gathered.
+        self._loader._read_ahead(self._prefix)
+        flat = np.array(ids).reshape(-1).astype(np.int64)
+        if flat.size and (flat.min() < 0 or flat.max() >= entry.shape[0]):
+            raise IndexError(f"token id out of range for a {entry.shape[0]}-row embedding")
+        unique, inverse = np.unique(flat, return_inverse=True)
+        row_bytes = entry.nbytes // entry.shape[0]
+        rows = np.empty((len(unique), entry.shape[1]), dtype=_DTYPES[entry.dtype])
+        view = memoryview(rows).cast("B")
+        with entry.file.open("rb", buffering=0) as fh:
+            for j, token in enumerate(unique):
+                fh.seek(entry.offset + int(token) * row_bytes)
+                got = fh.readinto(view[j * row_bytes:(j + 1) * row_bytes])
+                if got != row_bytes:
+                    raise OSError(f"short read of embedding row {token} in {entry.file}")
+        table = mx.array(rows)
+        if entry.dtype == "BF16":
+            table = table.view(mx.bfloat16)
+        if table.dtype != mx.uint32:
+            table = table.astype(self._loader.dtype)
+        out = table[mx.array(inverse.reshape(np.array(ids).shape).astype(np.uint32))]
+        mx.eval(out)
+        return out
+
+
+class _StreamedUnit(nn.Module):
+    """Load one unit, run its unchanged forward, and release it before returning."""
+
+    def __init__(self, loader, prefix, factory, sanitize=None):
+        super().__init__()
+        self._loader = loader
+        self._prefix = prefix
+        self._factory = factory
+        self._sanitize = sanitize
+
+    def __call__(self, *args, **kwargs):
+        from mlx.utils import tree_flatten
+
+        # Finish pending residual/deepstack operations before loading another unit.
+        mx.eval([v for _, v in tree_flatten((args, kwargs)) if isinstance(v, mx.array)])
+        module = self._loader.load(self._prefix, self._factory(), self._sanitize)
+        try:
+            result = module(*args, **kwargs)
+            mx.eval(result)
+            return result
+        finally:
+            del module
+            mx.clear_cache()
 
 
 class _FallbackProcessor:

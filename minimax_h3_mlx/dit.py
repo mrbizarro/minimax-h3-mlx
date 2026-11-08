@@ -474,6 +474,9 @@ class MiniMaxH3DiT(nn.Module):
         )
 
         skip = getattr(self, "skip_blocks", None) or ()
+        streamer = getattr(self, "streamer", None)
+        pipeline = streamer is not None and getattr(streamer.policy, "pipeline", False)
+        pending = None          # pipelined stream: the block queued on the GPU, not yet confirmed
         for i, block in enumerate(self.blocks):
             if i in skip:
                 # Gate-ranked layer skipping (opt-in, `--skip-blocks`): the residual stream passes
@@ -482,8 +485,37 @@ class MiniMaxH3DiT(nn.Module):
             modulation = (
                 modulation_cache.get(i) if modulation_cache is not None else block.adaln_proj(temb)
             )
-            call = block.compiled_call if getattr(self, "compile_image_blocks", False) else block
-            x = call(x, modulation, adaln_indices, rotary, mask)
+            if streamer is not None:
+                # Streamed DiT (low-memory): attach this block's weights, evaluate, release.
+                try:
+                    streamer.acquire(i)
+                    x = block(x, modulation, adaln_indices, rotary, mask)
+                    if pipeline:
+                        # Queue this block, then confirm the previous one and free its slot: the
+                        # GPU never waits for the host to build the next block's graph.
+                        mx.async_eval(x)
+                        if pending is not None:
+                            mx.eval(pending[1])
+                            streamer.release(pending[0])
+                        pending = (i, x)
+                        continue
+                    mx.eval(x)
+                except BaseException:
+                    streamer.abort()
+                    raise
+                streamer.release(i)
+            else:
+                call = block.compiled_call if getattr(self, "compile_image_blocks", False) else block
+                x = call(x, modulation, adaln_indices, rotary, mask)
+
+        if pending is not None:
+            try:
+                mx.eval(pending[1])
+            except BaseException:
+                streamer.abort()
+                raise
+            streamer.release(pending[0])
+            pending = None
 
         # 4. Both heads run over every row, then each modality's rows are selected.
         x = self.final_layer.norm_out(x, temb, timestep_indices)

@@ -585,7 +585,7 @@ class ViTDecoder3d(nn.Module):
         rotary = self.rope(position_ids)
 
         for block in self.transformer_blocks:
-            if compute is not None and compile_mixed_blocks():
+            if compute is not None and compile_mixed_blocks() and not getattr(block, "_streamed", False):
                 tokens = _compiled_mixed(block, compute)(tokens, *rotary)
             else:
                 tokens = block(tokens, rotary, compute)

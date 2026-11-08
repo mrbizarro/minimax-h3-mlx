@@ -165,21 +165,31 @@ def store_forward(dit, forward_args, modulation_cache, plan: RevoicePlan, kv_mod
     cos, sin = rotary
     store = KVStore(kv_mode)
     skip = getattr(dit, "skip_blocks", None) or ()
+    streamer = getattr(dit, "streamer", None)
     for i, block in enumerate(dit.blocks):
         if i in skip:
             store.k.append(None)
             store.v.append(None)
             continue
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation_cache.get(i)
-        h = block.norm1(x)
-        h = h * (1.0 + scale_msa[adaln_indices]) + shift_msa[adaln_indices]
-        q, k, v = _qkv(block.attn, h, cos, sin)
-        store.add(k[:, :, plan.cached], v[:, :, plan.cached])
-        x = x + gate_msa[adaln_indices] * _attend(block.attn, q, k, v, h.dtype)
-        h = block.norm2(x)
-        h = h * (1.0 + scale_mlp[adaln_indices]) + shift_mlp[adaln_indices]
-        x = x + gate_mlp[adaln_indices] * block.mlp(h)
-        mx.eval(x)
+        try:
+            if streamer is not None:
+                streamer.acquire(i)
+            h = block.norm1(x)
+            h = h * (1.0 + scale_msa[adaln_indices]) + shift_msa[adaln_indices]
+            q, k, v = _qkv(block.attn, h, cos, sin)
+            store.add(k[:, :, plan.cached], v[:, :, plan.cached])
+            x = x + gate_msa[adaln_indices] * _attend(block.attn, q, k, v, h.dtype)
+            h = block.norm2(x)
+            h = h * (1.0 + scale_mlp[adaln_indices]) + shift_mlp[adaln_indices]
+            x = x + gate_mlp[adaln_indices] * block.mlp(h)
+            mx.eval(x)
+        except BaseException:
+            if streamer is not None:
+                streamer.abort()
+            raise
+        if streamer is not None:
+            streamer.release(i)
     timestep_indices = forward_args[4]
     x = dit.final_layer.norm_out(x, temb, timestep_indices)
     audio_out = dit.final_layer.audio_out(x.astype(param_dtype(dit.final_layer.audio_out)))
@@ -208,21 +218,33 @@ def audio_forward(dit, audio_rows, timestep_table, timestep_indices, layout, pla
     # The packed buffer's dtype is the text stream's (the condition projection's); match it.
     xa = xa.astype(param_dtype(dit.condition_proj))
     skip = getattr(dit, "skip_blocks", None) or ()
+    streamer = getattr(dit, "streamer", None)
     for i, block in enumerate(dit.blocks):
         if i in skip:
             continue
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation_cache.get(i)
-        h = block.norm1(xa)
-        h = h * (1.0 + scale_msa[ai]) + shift_msa[ai]
-        q, k, v = _qkv(block.attn, h, cos_a, sin_a)
-        kc, vc = store.get(i)
-        keys = mx.concatenate([kc, k.astype(kc.dtype)], axis=2)
-        values = mx.concatenate([vc, v.astype(vc.dtype)], axis=2)
-        xa = xa + gate_msa[ai] * _attend(block.attn, q, keys, values, h.dtype)
-        h = block.norm2(xa)
-        h = h * (1.0 + scale_mlp[ai]) + shift_mlp[ai]
-        xa = xa + gate_mlp[ai] * block.mlp(h)
-        if i % 10 == 9:
+        try:
+            if streamer is not None:
+                streamer.acquire(i)
+            h = block.norm1(xa)
+            h = h * (1.0 + scale_msa[ai]) + shift_msa[ai]
+            q, k, v = _qkv(block.attn, h, cos_a, sin_a)
+            kc, vc = store.get(i)
+            keys = mx.concatenate([kc, k.astype(kc.dtype)], axis=2)
+            values = mx.concatenate([vc, v.astype(vc.dtype)], axis=2)
+            xa = xa + gate_msa[ai] * _attend(block.attn, q, keys, values, h.dtype)
+            h = block.norm2(xa)
+            h = h * (1.0 + scale_mlp[ai]) + shift_mlp[ai]
+            xa = xa + gate_mlp[ai] * block.mlp(h)
+            if streamer is not None:
+                mx.eval(xa)
+        except BaseException:
+            if streamer is not None:
+                streamer.abort()
+            raise
+        if streamer is not None:
+            streamer.release(i)
+        elif i % 10 == 9:
             mx.eval(xa)
     xa = dit.final_layer.norm_out(xa, temb, ti)
     out = dit.final_layer.audio_out(xa.astype(param_dtype(dit.final_layer.audio_out)))[0]
