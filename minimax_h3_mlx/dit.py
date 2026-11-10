@@ -397,7 +397,11 @@ class MiniMaxH3DiT(nn.Module):
         # 1. Project each modality and scatter the rows into the packed buffer. The text stream
         #    sets the dtype of the packed sequence.
         video_embeds = self.video_patch_proj(video_latents.astype(param_dtype(self.video_patch_proj)))
-        audio_embeds = self.audio_patch_proj(audio_latents.astype(param_dtype(self.audio_patch_proj)))
+        has_audio = audio_indices.shape[0] > 0
+        audio_embeds = (
+            self.audio_patch_proj(audio_latents.astype(param_dtype(self.audio_patch_proj)))
+            if has_audio else None
+        )
         text = self.condition_proj(text_embeds.astype(param_dtype(self.condition_proj)))
         text = self.token_refiner(text)
 
@@ -405,7 +409,8 @@ class MiniMaxH3DiT(nn.Module):
         x = mx.zeros((B, seq_len, text.shape[-1]), dtype=text.dtype)
         x[:, text_indices] = text
         x[:, video_indices] = video_embeds.astype(text.dtype)
-        x[:, audio_indices] = audio_embeds.astype(text.dtype)
+        if has_audio:
+            x[:, audio_indices] = audio_embeds.astype(text.dtype)
 
         # 2. One timestep embedding per distinct noise level, shared by all AdaLN projections.
         temb = self.embed_timesteps(timestep)
@@ -519,6 +524,15 @@ class MiniMaxH3DiT(nn.Module):
 
         # 4. Both heads run over every row, then each modality's rows are selected.
         x = self.final_layer.norm_out(x, temb, timestep_indices)
-        video_out = self.final_layer.video_out(x.astype(param_dtype(self.final_layer.video_out)))
+        heads = getattr(self, "pdd_heads", None)
+        if heads is not None:
+            # MiniMax-H3-Image (PDD): one fused output head per denoise step, picked by the caller.
+            weight, bias = heads
+            step = int(self.pdd_step)
+            video_out = x.astype(mx.float32) @ weight[step].T + bias[step]
+        else:
+            video_out = self.final_layer.video_out(x.astype(param_dtype(self.final_layer.video_out)))
+        if audio_indices.shape[0] == 0:
+            return video_out[:, video_indices], mx.zeros((x.shape[0], 0, self.config.audio_latents_dim), dtype=video_out.dtype)
         audio_out = self.final_layer.audio_out(x.astype(param_dtype(self.final_layer.audio_out)))
         return video_out[:, video_indices], audio_out[:, audio_indices]

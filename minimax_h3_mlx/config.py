@@ -53,6 +53,11 @@ class DiTConfig:
     # Pruned inference checkpoints replace the enormous per-block timestep MLP input with a
     # low-rank curve sampled on a fixed grid. ``None`` is the original checkpoint layout.
     adaln_curve_grid: int | None = None
+    # MiniMax-H3-Image: the audio branch is gone (no ``audio_patch_proj`` / ``final_layer.audio_out``
+    # in the checkpoint) and the per-block AdaLN projections are replaced by a precomputed table
+    # (``adaln_cache.safetensors``) for the release's fixed 6-step schedule.
+    audio_enabled: bool = True
+    adaln_precomputed: bool = False
 
     @property
     def inner_dim(self) -> int:

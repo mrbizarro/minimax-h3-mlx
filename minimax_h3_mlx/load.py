@@ -151,6 +151,12 @@ def load_dit(
         if verbose:
             print(f"  quantized structure: {recipe['bits']}-bit, group {recipe['group_size']}")
 
+    if config.adaln_precomputed:
+        # The per-block AdaLN projections are not in this pack: their output for the release's
+        # fixed schedule is shipped as ``adaln_cache.safetensors`` (see ``adaln.load_modulation_cache``).
+        from .adaln import drop_adaln_weights
+
+        drop_adaln_weights(model)
     expected = {key for key, _ in tree_flatten(model.parameters())}
     weights: dict[str, mx.array] = {}
     unexpected: list[str] = []
@@ -209,6 +215,13 @@ def load_dit(
             print(f"  {shard.name}: {len(loaded)} tensors, {gb:.2f} GB, "
                   f"{time.perf_counter() - started:.1f}s")
 
+    if not config.audio_enabled:
+        # An audio-free checkpoint (MiniMax-H3-Image) has no audio tensors; the module keeps small
+        # zero ones so the tree is unchanged. They are never read (no audio rows are packed).
+        for key in sorted(expected - weights.keys()):
+            if key.startswith(("audio_patch_proj.", "final_layer.audio_out.")):
+                shape = dict(tree_flatten(model.parameters()))[key].shape
+                weights[key] = mx.zeros(shape, dtype=mx.float32)
     missing = sorted(expected - weights.keys())
     if strict and (missing or unexpected):
         raise KeyError(

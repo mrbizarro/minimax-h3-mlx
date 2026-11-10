@@ -130,3 +130,20 @@ def schedule_timesteps(sigmas: mx.array, conditioning_level: float = 0.0) -> mx.
 def modality_row(timestep_index: int, tag: int) -> int:
     """Row of the modulation table addressed by a ``(timestep, modality)`` pair."""
     return timestep_index * MODALITY_NUM + max(tag, 0)
+
+
+def save_modulation_cache(cache: ModulationCache, path) -> None:
+    """Write a cache as one safetensors file: ``timesteps`` plus ``blocks.<i>.<j>`` (j = 0..5)."""
+    tensors = {"timesteps": cache.timesteps.astype(mx.float32)}
+    for i, table in enumerate(cache.tables):
+        for j, t in enumerate(table):
+            tensors[f"blocks.{i}.{j}"] = t
+    mx.save_safetensors(str(path), tensors)
+
+
+def load_modulation_cache(path) -> ModulationCache:
+    """Inverse of :func:`save_modulation_cache`."""
+    raw = mx.load(str(path))
+    n = 1 + max(int(k.split(".")[1]) for k in raw if k.startswith("blocks."))
+    tables = [tuple(raw[f"blocks.{i}.{j}"] for j in range(6)) for i in range(n)]
+    return ModulationCache(tables, raw["timesteps"])
