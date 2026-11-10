@@ -192,11 +192,13 @@ class H3ImageRunner:
 
     ``root`` is the folder ``scripts/fetch_h3_image.py`` builds (``dit/``, ``vae/``,
     ``pdd_fused_heads.safetensors``); ``text_dir`` is the H3 text-encoder folder the other H3 modes
-    already use (config.json + text_encoder.safetensors + tokenizer).
+    already use (the Q8 ``ddalcu-q8`` folder) and ``text_config`` the upstream ``text_encoder/config.json``.
     """
 
-    def __init__(self, root: str | Path, text_dir: str | Path, compile_blocks: bool = False):
+    def __init__(self, root: str | Path, text_dir: str | Path, text_config: str | Path | None = None,
+                 compile_blocks: bool = False):
         self.root, self.text_dir = Path(root), Path(text_dir)
+        self.text_config = Path(text_config) if text_config else None
         self.compile_blocks = compile_blocks
         self.metrics: dict = {}
 
@@ -216,7 +218,7 @@ class H3ImageRunner:
         m["canvas"] = [cw, ch]
 
         started = time.perf_counter()
-        encoder = MiniMaxH3TextEncoder(self.text_dir, load_vision=False, verbose=False)
+        encoder = MiniMaxH3TextEncoder(self.text_dir, load_vision=False, verbose=False, config_path=self.text_config)
         cond, tags = encoder.encode(prompt)
         mx.eval(cond)
         m["text_seconds"], m["text_rows"] = time.perf_counter() - started, int(cond.shape[1])
