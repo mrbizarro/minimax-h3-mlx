@@ -66,13 +66,13 @@ class PH3ImageTextEncoder(MiniMaxH3TextEncoder):
                          verbose=verbose, taps=taps)
         self.connector = PH3ImageTextConnector.from_dir(connector_dir or root / "text_connector")
 
-    def build_request(self, prompt: str, images: list | None = None):
+    def build_request(self, prompt: str, images: list | None = None, label_format: str = "<Picture {n}>: "):
         if images and not prompt.lstrip().startswith(_EDIT_STARTS):
             prompt = EDIT_PREFIX + prompt
-        return super().build_request(prompt, images)
+        return super().build_request(prompt, images, label_format)
 
-    def encode(self, prompt: str, images: list | None = None):
-        tapped, tags = super().encode(prompt, images)
+    def encode(self, prompt: str, images: list | None = None, label_format: str = "<Picture {n}>: "):
+        tapped, tags = super().encode(prompt, images, label_format)
         cond = self.connector(tapped)
         mx.eval(cond)
         return cond, tags

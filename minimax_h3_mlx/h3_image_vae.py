@@ -28,7 +28,7 @@ import numpy as np
 from mlx.utils import tree_flatten, tree_unflatten
 
 from .ph3_image_vae import PH3ImageVAE, _run_block, decode_to_uint8  # noqa: F401  (re-exported)
-from .video_vae import VideoVAEConfig, ViTDecoder3d, ViTRotaryPosEmbed
+from .video_vae import VideoVAE, VideoVAEConfig, ViTDecoder3d, ViTRotaryPosEmbed
 
 SPATIAL_RATIO = 16
 
@@ -144,6 +144,54 @@ def load_h3_image_vae(path: str | Path, config_json: dict, dtype: mx.Dtype = mx.
     missing, extra = sorted(expected - weights.keys()), sorted(weights.keys() - expected)
     if missing or extra:
         raise KeyError(f"H3-Image VAE mismatch: missing {missing[:4]}, unexpected {extra[:4]}")
+    model.update(tree_unflatten(list(weights.items())))
+    mx.eval(model.parameters())
+    return model
+
+
+class H3ImageEncoder(VideoVAE):  # reuses only its tiled ``_encode_clip``
+    """The release's CNN encoder + ``quant_conv``, with the video VAE's encode tiling (256 px tiles,
+    64 px overlap: ``vae_tile_size`` / ``vae_tile_overlap_min``). No decoder is built."""
+
+    def __init__(self, config: VideoVAEConfig):
+        from .video_vae import CausalConv3d, Encoder3d
+
+        nn.Module.__init__(self)
+        self.config = config
+        self.encoder = Encoder3d(config)
+        self.quant_conv = CausalConv3d(2 * config.latent_channels, 2 * config.latent_channels, 1)
+        self.use_tiling = True
+        self.tile_sample_min_height = 256
+        self.tile_sample_min_width = 256
+        self.tile_sample_min_overlap_height = 64
+        self.tile_sample_min_overlap_width = 64
+
+
+def load_h3_image_vae_encoder(path: str | Path, config_json: dict):
+    """Encode-only image VAE for edit references: the CNN encoder + ``quant_conv`` of the release.
+
+    The release's encoder is the H3 video VAE's own architecture (``EncoderFCN3D``, ch 128,
+    ``ch_mult [1, 2, 2, 4, 4, 8]``, ``space_down [2, 2, 2, 2, 1, 1]``) with its own weights, so it
+    runs in :class:`~minimax_h3_mlx.video_vae.VideoVAE`'s encoder with the decoder never built. A
+    reference is one frame: the temporal strides of the video layout reduce to one output frame
+    either way, so the image config's ``(1,) * 6`` temporal factors give the same result.
+    The published conv weights are PyTorch ``(O, I, kD, kH, kW)``; MLX wants ``(O, kD, kH, kW, I)``.
+    """
+    cfg = h3_image_vae_config(config_json)
+    model = H3ImageEncoder(cfg)
+    expected = {k for k, _ in tree_flatten(model.parameters())}
+    weights = {}
+    for key, value in mx.load(str(path)).items():
+        if not key.startswith(("encoder.", "quant_conv.")):
+            continue
+        if key not in expected:
+            raise KeyError(f"unexpected encoder tensor {key} in {path}")
+        if value.ndim == 5:
+            value = value.transpose(0, 2, 3, 4, 1)
+        weights[key] = value.astype(mx.float32)
+    missing = sorted(expected - weights.keys())
+    if missing:
+        raise KeyError(f"H3-Image VAE encoder: {len(missing)} tensors missing, e.g. {missing[:4]}")
     model.update(tree_unflatten(list(weights.items())))
     mx.eval(model.parameters())
     return model

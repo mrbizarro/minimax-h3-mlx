@@ -354,7 +354,7 @@ class MiniMaxH3TextEncoder:
 
     # -- request presentation --------------------------------------------------------------
 
-    def build_request(self, prompt: str, images: list | None = None):
+    def build_request(self, prompt: str, images: list | None = None, label_format: str = "<Picture {n}>: "):
         """Build H3's token sequence and its per-row modality tags.
 
         Returns ``(input_ids, token_tags, vision_inputs)``; ``vision_inputs`` is ``None`` for a
@@ -378,7 +378,9 @@ class MiniMaxH3TextEncoder:
 
             for index in range(len(images)):
                 num_image_tokens = int(grid_thw[index].prod()) // merge
-                label_ids = self.tokenizer(f"<Picture {index + 1}>: ", add_special_tokens=False)["input_ids"]
+                # The video lane labels a picture "<Picture n>: "; the image release (edit) uses
+                # "Picture n: " without the angle brackets (SGLang minimax_h3_image_presentation).
+                label_ids = self.tokenizer(label_format.format(n=index + 1), add_special_tokens=False)["input_ids"]
                 vision_ids = [start] + [pad] * num_image_tokens + [end]
                 token_ids += label_ids + vision_ids
                 # The whole vision block is tagged *video*; only the label stays text.
@@ -437,11 +439,12 @@ class MiniMaxH3TextEncoder:
         # No `model.norm(h)`: H3 conditions on the unnormalized state.
         return h
 
-    def encode(self, prompt: str, images: list | None = None) -> tuple[mx.array, np.ndarray]:
+    def encode(self, prompt: str, images: list | None = None,
+               label_format: str = "<Picture {n}>: ") -> tuple[mx.array, np.ndarray]:
         """Encode a request into ``((1, num_text_tokens, 5120), (num_text_tokens,))``."""
         from mlx_vlm.models.qwen3_vl.language import LanguageModel
 
-        input_ids, token_tags, vision_inputs = self.build_request(prompt, images)
+        input_ids, token_tags, vision_inputs = self.build_request(prompt, images, label_format)
 
         inputs_embeds = None
         visual_pos_masks = None
