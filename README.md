@@ -11,6 +11,8 @@ MiniMax's omni-modal generative system for synchronized **video + audio** genera
 > as we know (8-megapixel images, about 5 minutes each on an M4 Max, quoted text spelled exactly). One-click
 > install through Pinokio, no terminal. **[phosphene.video](https://phosphene.video)** ·
 > [GitHub](https://github.com/mrbizarro/Phosphene) · [P-H3-Image how-to](https://phosphene.video/docs/images/#p-h3-image)
+>
+> **Will it run on your Mac?** H3 runs from 16 GB. See what each memory size can make, and how long a clip takes: [phosphene.video/mac-requirements](https://phosphene.video/mac-requirements/?utm_source=github&utm_medium=minimax-h3-mlx)
 
 H3 is **not** a language model. It is a diffusers pipeline: a 33B diffusion transformer denoising
 video and audio latents jointly, conditioned by a frozen Qwen3-VL-32B encoder, with separate video
