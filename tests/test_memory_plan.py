@@ -171,5 +171,145 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(args.decode_cache_gb, 1.0)
 
 
+# Real H3 checkpoint sizes (GiB) as the runner reports them in its metrics (Q8 DiT, 17 Nov 2026).
+REAL_SIZES = mp.CheckpointSizes(
+    te_total=25.574, te_vision=0.71, te_max_unit=1.449, te_max_layer=0.483,
+    te_max_vision_unit=0.044, dit_total=20.213, dit_block_stream=0.381, dit_nonblock=1.147,
+    video_vae=4.85, audio_vae=0.564, vae_block=0.125, vae_decode_fixed=0.012)
+STREAMED_WEIGHTS = 0.012 + 2 * 0.125
+
+# Measured decoder peaks (MLX GiB, M4 Max, mlx 0.32.4, 124 frames), from
+# today-2026-11-17/m5-next/out/decode.json and decode_streamed.json. Byte-identical frames in
+# every mode. Key: (width, height, streamed, tile batch) -> peak including the decoder weights.
+MEASURED_PEAKS = {
+    (512, 288, False, 8): 6.704, (512, 288, False, 1): 6.245,
+    (768, 448, False, 8): 7.126, (768, 448, False, 1): 6.529,
+    (1024, 576, False, 8): 7.832, (1024, 576, False, 1): 7.058,
+    (768, 448, True, 8): 2.276, (768, 448, True, 1): 1.683,
+    (1024, 576, True, 8): 2.677, (1024, 576, True, 1): 2.232,
+}
+RESIDENT_WEIGHTS = 4.85
+
+
+def _work(w, h, streamed, batch, frames=124):
+    """The curve's MLX working set alone (the host clip term taken out)."""
+    host = frames * w * h * 3 / GIB
+    return mp.decode_work_gib(w, h, batch, streamed=streamed, frames=frames) - host
+
+
+class DecodeCurveTests(unittest.TestCase):
+    """The decoder estimate follows the measured curve (H3 planner over-estimate, 17 Nov 2026)."""
+
+    def test_curve_covers_every_measured_point(self):
+        for (w, h, streamed, batch), peak in MEASURED_PEAKS.items():
+            weights = STREAMED_WEIGHTS if streamed else RESIDENT_WEIGHTS
+            with self.subTest(w=w, h=h, streamed=streamed, batch=batch):
+                self.assertGreaterEqual(_work(w, h, streamed, batch), peak - weights)
+
+    def test_streamed_curve_is_tight_to_the_measurement(self):
+        # The low-memory decoder is what 16-24 GB Macs run: at most 0.4 GiB of headroom per point
+        # before MARGIN, where the old flat term put 1.2-3.0 GiB on top.
+        for (w, h, streamed, batch), peak in MEASURED_PEAKS.items():
+            if not streamed:
+                continue
+            with self.subTest(w=w, h=h, batch=batch):
+                over = _work(w, h, True, batch) - (peak - STREAMED_WEIGHTS)
+                self.assertLessEqual(over, 0.40)
+
+    def test_1024x576_streamed_no_longer_budgets_5_gib(self):
+        # Report: 5.4 GiB budgeted for decoder working memory, about 2.4-3.0 used.
+        self.assertLess(_work(1024, 576, True, 8), 3.0)
+        old = 9.2 * 1024 * 576 / 1e6
+        self.assertGreater(old, 5.4)
+        rows = mp.packed_rows(1024, 576, 124, 300)
+        est = mp.estimate(REAL_SIZES, rows, 1024, 576, vision=False, lowmem=True, vae_batch=8,
+                          stream_vae=True)
+        # (0.26 weights + 2.8 work + 0.21 clip + 1.0 cache + 0.5 runtime) x 1.10
+        self.assertLess(est["decode"], 5.5)
+        self.assertGreaterEqual(est["decode"], round((MEASURED_PEAKS[(1024, 576, True, 8)]
+                                                      + mp.RUNTIME_GIB) * mp.MARGIN, 2))
+
+    def test_real_render_streamed_decode_is_covered(self):
+        # weaker-macs-gpu/renders/fast_16: 640x384, streamed, batch 8, video_vae_decode 2.05 GiB.
+        self.assertGreaterEqual(_work(640, 384, True, 8) + STREAMED_WEIGHTS, 2.05)
+
+    def test_resident_stays_conservative(self):
+        # Inside a full render the resident decoder peaked above the isolated bench: 8.00 GiB MLX
+        # at 768x448 batch 8 (3.15 working) and 7.19 at batch 1 (2.34 working). Both covered.
+        self.assertGreaterEqual(_work(768, 448, False, 8), 3.15)
+        self.assertGreaterEqual(_work(768, 448, False, 1), 2.34)
+        for w, h in ((512, 288), (768, 448), (1024, 576), (1280, 720)):
+            for batch in (1, 8):
+                with self.subTest(w=w, h=h, batch=batch):
+                    self.assertGreater(_work(w, h, False, batch), _work(w, h, True, batch))
+
+    def test_unmeasured_canvas_uses_the_old_slope_for_the_excess(self):
+        top = _work(1024, 576, True, 8)
+        mp_excess = (1280 * 720 - 1024 * 576) / 1e6
+        self.assertAlmostEqual(_work(1280, 720, True, 8), top + 9.2 * mp_excess, places=6)
+        self.assertGreater(_work(1920, 1088, True, 1), _work(1280, 720, True, 1))
+
+    def test_longer_clips_add_their_finished_frames(self):
+        short = mp.decode_work_gib(1024, 576, 8, streamed=True, frames=124)
+        long = mp.decode_work_gib(1024, 576, 8, streamed=True, frames=244)
+        self.assertAlmostEqual(long - short, 120 * 1024 * 576 * 3 / GIB, places=9)
+        self.assertEqual(mp.decode_work_gib(1024, 576, 8, streamed=True),
+                         mp.decode_work_gib(1024, 576, 8, streamed=True, frames=124))
+
+    def test_chained_windows_price_all_their_frames(self):
+        args = SimpleNamespace(compact_root=None, dit=None, lora=None, reference=None,
+                               extend_from=None, width=1024, height=576, memory_gb=10.0,
+                               low_memory="auto", lora_qkv_permute=False, lora_fc1_swap=False,
+                               revoice_steps=0, stream_vae_decoder=False, cache_gb=None,
+                               decode_cache_gb=None, stream_text_encoder=False, stream_dit=False,
+                               dit_pipeline=False)
+        mem = {"ram_gib": 16.0, "available_gib": 10.0, "gpu_working_set_gib": 12.0,
+               "swap_used_gib": 0.0, "simulated": True}
+        seen = {}
+
+        def spy(*a, **kw):
+            seen["frames"] = kw.get("frames")
+            return mp.Plan("lowmem", passes={"decode": 1.0}, peak_pass="decode", peak_gib=1.0)
+
+        with mock.patch.object(mp, "checkpoint_sizes", return_value=REAL_SIZES), \
+                mock.patch.object(mp, "machine_memory", return_value=mem), \
+                mock.patch.object(mp, "choose", side_effect=spy):
+            mp.plan_for_request(args, {}, 124, 3, [[]], ["p"])
+        self.assertEqual(seen["frames"], 372)
+
+
+class DecodeLadderOnRealSizesTests(unittest.TestCase):
+    """What a 16 GB Mac gets (budget 10 GiB, the Studio's h3_memory_budget)."""
+
+    def _plan(self, w, h, available):
+        rows = mp.packed_rows(w, h, 124, 300)
+        return mp.choose(REAL_SIZES, rows, w, h, 10.0, vision=False, mode="auto",
+                         available_gib=available)
+
+    def test_1024x576_keeps_eight_tiles_when_the_decoder_fits(self):
+        # Before: a tight denoise (9.75 GiB) walked the decoder down to one tile per call (+13 %
+        # decode time) at 8 GiB free, though the streamed eight-tile decode needs about 5.3.
+        for available in (10.0, 8.0, 7.0, 6.0):
+            with self.subTest(available=available):
+                plan = self._plan(1024, 576, available)
+                self.assertEqual((plan.mode, plan.stream_vae_decoder, plan.vae_batch),
+                                 ("lowmem", True, 8))
+                self.assertLessEqual(plan.passes["decode"], available)
+
+    def test_one_tile_only_when_the_decode_itself_does_not_fit(self):
+        plan = self._plan(1280, 720, 8.0)
+        self.assertEqual((plan.stream_vae_decoder, plan.vae_batch), (True, 1))
+        rows = mp.packed_rows(1280, 720, 124, 300)
+        b8 = mp.estimate(REAL_SIZES, rows, 1280, 720, vision=False, lowmem=True, vae_batch=8,
+                         stream_vae=True)
+        self.assertGreater(b8["decode"], 8.0)
+
+    def test_admission_still_judges_the_largest_pass(self):
+        plan = self._plan(1024, 576, 6.0)
+        self.assertEqual(plan.peak_pass, "denoise")
+        mem = {"ram_gib": 16.0, "available_gib": 6.0}
+        self.assertEqual(mp.admit(plan, mem, 10.0).verdict, "busy")
+
+
 if __name__ == "__main__":
     unittest.main()

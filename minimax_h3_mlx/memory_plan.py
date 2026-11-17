@@ -41,9 +41,39 @@ RUNTIME_GIB = 0.50
 DENOISE_GIB_PER_KROW = 0.185
 #: Encoder working memory over one unit (hidden states, dequantization scratch).
 ENCODE_WORK_GIB = 0.30
-#: Video-VAE decode working memory per megapixel of canvas, by tile batch (fp16 decode):
-#: 3.15 GiB at 0.344 MP batch 8, 2.34 GiB at batch 1 (7.19 GiB MLX peak with 4.85 of weights).
-DECODE_GIB_PER_MP = {1: 6.8, 8: 9.2}
+#: Video-VAE decode working memory (MLX, above the decoder weights) as ``fixed + per_mp * MP``,
+#: keyed by (streamed decoder?, tile batch). Working memory is mostly the tile batch in flight,
+#: not the canvas, so a flat GiB-per-megapixel term (the old 6.8/9.2) over-priced big canvases:
+#: 5.4 GiB at 1024x576 batch 8 against 3.0 measured resident and 2.4 streamed. Measured on M4 Max,
+#: mlx 0.32.4, fp16-mixed, 124 frames (today-2026-11-17/m5-next/out/decode*.json), working GiB:
+#:                    512x288 (0.147 MP)  768x448 (0.344 MP)  1024x576 (0.590 MP)
+#:   resident  b8           1.85                2.27                2.97
+#:   resident  b1           1.39                1.67                2.19
+#:   streamed  b8             -                 2.01                2.42   (peak minus 0.26 GiB:
+#:   streamed  b1             -                 1.42                1.97    fixed + two blocks)
+#: Safety margin, before MARGIN and RUNTIME_GIB are applied on top:
+#: - streamed (the low-memory decoder, the one 16-24 GB Macs run): a common slope of 2.55 GiB/MP
+#:   (the steepest fitted) and an intercept 0.15 GiB above the highest measured point, so every
+#:   point sits 0.15-0.38 GiB under the line. A real 640x384 streamed render peaked at 2.05 GiB
+#:   (weaker-macs-gpu/renders/fast_16); the line says 2.19 there.
+#: - resident (the normal decoder) stays conservative: inside a full render it peaked 0.9 GiB
+#:   above the isolated bench (8.00 GiB MLX peak at 768x448 batch 8, the old 3.15 calibration),
+#:   so its line is lifted to cover that run, not the bench.
+#: Above the largest measured canvas the old per-megapixel slope prices the excess, so an
+#: unmeasured size is never cheaper than the measured trend allows.
+DECODE_WORK_GIB = {
+    (False, 8): (2.40, 2.55),   # 2.77 / 3.28 / 3.90 vs bench 1.85 / 2.27 / 2.97, full render 3.15
+    (False, 1): (1.80, 1.85),   # 2.07 / 2.44 / 2.89 vs bench 1.39 / 1.67 / 2.19, full render 2.34
+    (True, 8): (1.30, 2.55),    # 2.18 / 2.80 vs 2.01 / 2.42
+    (True, 1): (0.70, 2.55),    # 1.58 / 2.20 vs 1.42 / 1.97
+}
+#: The largest canvas the curve was measured at; beyond it the old per-MP slope applies.
+DECODE_MEASURED_MAX_MP = 1024 * 576 / 1e6
+DECODE_EXTRAPOLATE_GIB_PER_MP = {1: 6.8, 8: 9.2}
+#: Frames the curve was measured at, and the default when a caller does not say. The decoder's GPU
+#: working memory does not grow with clip length (pieces are pipelined to the host), but the
+#: finished uint8 clip (frames x width x height x 3 bytes, outside MLX's counters) does.
+DECODE_MEASURED_FRAMES = 124
 #: Low-memory buffer-cache caps (MLX keeps freed buffers for reuse up to these).
 LOWMEM_CACHE_GIB = 2.0
 LOWMEM_DECODE_CACHE_GIB = 1.0
@@ -187,9 +217,23 @@ class Plan:
         return {k: v for k, v in asdict(self).items() if k not in ("passes", "peak_pass", "peak_gib")}
 
 
+def decode_work_gib(width: int, height: int, vae_batch: int, *, streamed: bool,
+                    frames: int | None = None) -> float:
+    """Video-decode memory above the decoder weights (GiB, no margin): the MLX working set from
+    the measured curve plus the finished uint8 clip, which grows with the clip on the host."""
+    b = 1 if vae_batch <= 1 else 8
+    fixed, per_mp = DECODE_WORK_GIB[(bool(streamed), b)]
+    mp = int(width) * int(height) / 1e6
+    work = fixed + per_mp * min(mp, DECODE_MEASURED_MAX_MP)
+    if mp > DECODE_MEASURED_MAX_MP:
+        work += DECODE_EXTRAPOLATE_GIB_PER_MP[b] * (mp - DECODE_MEASURED_MAX_MP)
+    host = int(frames or DECODE_MEASURED_FRAMES) * int(width) * int(height) * 3 / GIB
+    return work + host
+
+
 def estimate(sizes: CheckpointSizes, rows: int, width: int, height: int, *, vision: bool,
              lowmem: bool, vae_batch: int, lora_streams: bool = False,
-             stream_vae: bool = False) -> dict:
+             stream_vae: bool = False, frames: int | None = None) -> dict:
     """Estimated process footprint (GiB) of each pass under one setting, margin included."""
     lora_gib = sum(g for _, g in sizes.lora)
     vis = sizes.te_vision if vision else 0.0
@@ -209,17 +253,16 @@ def estimate(sizes: CheckpointSizes, rows: int, width: int, height: int, *, visi
         weights = sizes.dit_total + lora_gib
         cache = dcache = 0.0
     denoise = weights + DENOISE_GIB_PER_KROW * rows / 1000.0
-    b = 1 if vae_batch <= 1 else 8
-    vae_weights = (sizes.vae_decode_fixed + 2 * sizes.vae_block) if (lowmem and stream_vae) \
-        else sizes.video_vae
-    decode = vae_weights + DECODE_GIB_PER_MP[b] * int(width) * int(height) / 1e6
+    streamed = bool(lowmem and stream_vae)
+    vae_weights = (sizes.vae_decode_fixed + 2 * sizes.vae_block) if streamed else sizes.video_vae
+    decode = vae_weights + decode_work_gib(width, height, vae_batch, streamed=streamed, frames=frames)
     passes = {"encode": encode + cache, "denoise": denoise + cache, "decode": decode + dcache}
     return {k: round((v + RUNTIME_GIB) * MARGIN, 2) for k, v in passes.items()}
 
 
 def choose(sizes: CheckpointSizes, rows: int, width: int, height: int, budget_gib: float, *,
            vision: bool, mode: str, lora_streams: bool = False,
-           available_gib: float | None = None) -> Plan:
+           available_gib: float | None = None, frames: int | None = None) -> Plan:
     """``mode``: ``off`` = today's path always; ``on`` = low memory always; ``auto`` = today's path
     when it fits, otherwise the low-memory settings.
 
@@ -227,7 +270,8 @@ def choose(sizes: CheckpointSizes, rows: int, width: int, height: int, budget_gi
     big Mac with a full desktop streams instead of pushing everything else into swap.
     """
     target = budget_gib if available_gib is None else min(budget_gib, available_gib)
-    resident = estimate(sizes, rows, width, height, vision=vision, lowmem=False, vae_batch=8)
+    resident = estimate(sizes, rows, width, height, vision=vision, lowmem=False, vae_batch=8,
+                        frames=frames)
     if mode == "off" or (mode == "auto" and max(resident.values()) <= target):
         peak = max(resident, key=resident.get)
         return Plan("resident", passes=resident, peak_pass=peak, peak_gib=resident[peak])
@@ -236,7 +280,7 @@ def choose(sizes: CheckpointSizes, rows: int, width: int, height: int, budget_gi
     # handful of decoder calls, each rereading 4.5 GiB under compute), then one tile per call.
     for stream_vae, batch in LOWMEM_DECODE_LADDER:
         est = estimate(sizes, rows, width, height, vision=vision, lowmem=True, vae_batch=batch,
-                       lora_streams=lora_streams, stream_vae=stream_vae)
+                       lora_streams=lora_streams, stream_vae=stream_vae, frames=frames)
         peak = max(est, key=est.get)
         plan = Plan("lowmem", stream_text_encoder=True, stream_dit=True, dit_pipeline=True,
                     stream_vae_decoder=stream_vae,
@@ -244,7 +288,9 @@ def choose(sizes: CheckpointSizes, rows: int, width: int, height: int, budget_gi
                     vae_batch=batch, passes=est,
                     peak_pass=peak, peak_gib=est[peak])
         best = plan
-        if est[peak] <= target:
+        # Passes never overlap, so only the decode pass decides the decode setting: a tight
+        # denoise must not push a decode that already fits down to the slower one-tile step.
+        if est["decode"] <= target:
             break
     return best
 
@@ -370,14 +416,17 @@ def plan_for_request(args, device: dict, frames: int, chain: int, window_keyfram
     budget = min(float(args.memory_gb), mem["ram_gib"] - os_reserve_gib(mem["ram_gib"]))
     transformed = bool(getattr(args, "lora_qkv_permute", False) or getattr(args, "lora_fc1_swap", False))
     mode = getattr(args, "low_memory", "off")
+    # Each window decodes its own frames, but earlier windows' finished frames stay on the host.
+    clip_frames = int(frames) * max(1, int(chain or 1))
     plan = choose(sizes, rows, args.width, args.height, budget, vision=vision,
                   mode="off" if mode == "off" else mode, lora_streams=not transformed,
-                  available_gib=mem["available_gib"])
+                  available_gib=mem["available_gib"], frames=clip_frames)
     if plan.mode == "lowmem" and getattr(args, "stream_vae_decoder", False) and not plan.stream_vae_decoder:
         # The caller asked for the streamed decoder: estimate what will actually run.
         batch = 1 if os.environ.get("H3_VAE_BATCH") in ("0", "1") else plan.vae_batch
         plan.passes = estimate(sizes, rows, args.width, args.height, vision=vision, lowmem=True,
-                               vae_batch=batch, lora_streams=not transformed, stream_vae=True)
+                               vae_batch=batch, lora_streams=not transformed, stream_vae=True,
+                               frames=clip_frames)
         plan.stream_vae_decoder, plan.vae_batch = True, batch
         plan.peak_pass = max(plan.passes, key=plan.passes.get)
         plan.peak_gib = plan.passes[plan.peak_pass]
