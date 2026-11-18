@@ -75,10 +75,25 @@ DECODE_EXTRAPOLATE_GIB_PER_MP = {1: 6.8, 8: 9.2}
 #: finished uint8 clip (frames x width x height x 3 bytes, outside MLX's counters) does.
 DECODE_MEASURED_FRAMES = 124
 #: Low-memory buffer-cache caps (MLX keeps freed buffers for reuse up to these).
-LOWMEM_CACHE_GIB = 2.0
-LOWMEM_DECODE_CACHE_GIB = 1.0
+#: 0.5 since 13 Nov 2026 (was 2.0 / 1.0): the same frames bit for bit and the same wall clock
+#: (Standard 5 s at 16 GB: 257.7 s -> 255.8 s), 1.4 GB lower peak (footprint 7.6 -> 6.2 GB).
+LOWMEM_CACHE_GIB = 0.5
+LOWMEM_DECODE_CACHE_GIB = 0.5
 #: Decode settings tried in order until the plan fits: (stream the VAE decoder?, tile batch).
-LOWMEM_DECODE_LADDER = ((False, 8), (True, 8), (True, 1))
+#: Streamed first since 13 Nov 2026: once the other passes got cheaper, a resident decoder became
+#: the plan's peak (Draft 5 s at 16 GB: 7.6 -> 8.2 GB) to save ~2 s of a 35 s decode. On a small
+#: Mac the lower peak is worth more than the two seconds.
+LOWMEM_DECODE_LADDER = ((True, 8), (True, 1))
+#: Carried-context / held-picture encode (a chain's second window on, Extend, Add sound): the CNN
+#: encoder over one 17-frame clip of a 256 px tile (the tile size is fixed, so this does not grow
+#: with the canvas). MLX peak by encoder time-chunk setting, measured M4 Max at 640x384 and
+#: 768x448: 11.06 GiB in one call (footprint 12.7); ~7.1 GiB at 5 frames per call.
+MEDIA_ENCODE_GIB = {0: 11.1, 5: 7.1}
+#: Output frames per encoder convolution call on a low-memory plan. 5 is the smallest slice whose
+#: latents are bit-identical to the one-call encode on the real weights (mlx 0.32.4, 640x384,
+#: 768x448, 1024x576: same sha256); at 4 and below MLX dispatches a different convolution kernel
+#: and the latents move (a different take after the denoise). 14.4 -> 7.6 GiB, same speed.
+LOWMEM_ENCODE_CHUNK = 5
 #: Every estimate is inflated by this before it is compared with a budget.
 MARGIN = 1.10
 
@@ -365,7 +380,8 @@ def admit(plan: Plan, mem: dict, budget_gib: float | None = None) -> Admission:
         can_give = min(can_give, budget_gib)
     free_now = mem["available_gib"]
     label = {"encode": "reading the prompt", "denoise": "making the clip",
-             "decode": "finishing the video", "revoice": "cleaning up the sound"}.get(
+             "decode": "finishing the video", "revoice": "cleaning up the sound",
+             "media_encode": "carrying the last frames into the next part"}.get(
                  plan.peak_pass, plan.peak_pass)
     if need > can_give:
         return Admission("cannot", need, plan.peak_pass, round(can_give, 2), free_now,
@@ -386,6 +402,12 @@ def admit(plan: Plan, mem: dict, budget_gib: float | None = None) -> Admission:
 #: per-group scales); the studio prices "Clean up sound" with the same figure.
 REVOICE_KV_BYTES_PER_ROW = 2 * 7168 * 50 * (1 + 4 / 128)
 REFERENCE_ROWS = 2 * 1376
+
+
+def revoice_disk_gib(kv_gib: float, blocks: int = 50) -> float:
+    """What a re-voice store kept on disk holds in memory: two blocks of int8 (in use, being
+    read) and the bf16 copy one block dequantises into (twice the int8 bytes)."""
+    return 4.0 * kv_gib / blocks
 EXIT_CANNOT = 76          # this Mac cannot hold the largest pass (75 is the studio's stop code)
 EXIT_BUSY = 77            # it could, but other apps leave too little free right now
 
@@ -430,10 +452,31 @@ def plan_for_request(args, device: dict, frames: int, chain: int, window_keyfram
         plan.stream_vae_decoder, plan.vae_batch = True, batch
         plan.peak_pass = max(plan.passes, key=plan.passes.get)
         plan.peak_gib = plan.passes[plan.peak_pass]
+    if history or getattr(args, "video_to_audio", None) is not None:
+        # This pass was not priced before 13 Nov 2026, so a 10 s chain on a 16 GB plan was
+        # admitted at ~7.7 GiB and peaked at ~13 GiB in its second window.
+        chunk = getattr(args, "vae_encode_chunk", None)
+        if chunk is None:
+            chunk = LOWMEM_ENCODE_CHUNK if plan.mode == "lowmem" else 0
+        enc = MEDIA_ENCODE_GIB.get(int(chunk), MEDIA_ENCODE_GIB[0])
+        cache = LOWMEM_CACHE_GIB if plan.mode == "lowmem" else 0.0
+        plan.passes["media_encode"] = round((enc + cache + RUNTIME_GIB) * MARGIN, 2)
+        peak = max(plan.passes, key=plan.passes.get)
+        plan.peak_pass, plan.peak_gib = peak, plan.passes[peak]
     revoice = int(getattr(args, "revoice_steps", 0) or 0) > 0 and getattr(args, "revoice_kv", "int8") != "off"
     if revoice:
         kv = rows * REVOICE_KV_BYTES_PER_ROW * (2 if getattr(args, "revoice_kv", "int8") == "bf16" else 1) / GIB
-        plan.passes["revoice"] = round(plan.passes["denoise"] + kv * MARGIN, 2)
+        where = getattr(args, "revoice_kv_store", "auto") or "auto"
+        in_memory = round(plan.passes["denoise"] + kv * MARGIN, 2)
+        # On disk the store costs two blocks of it (the one in use and the one being read).
+        on_disk = round(plan.passes["denoise"] + revoice_disk_gib(kv) * MARGIN, 2)
+        target = min(budget, mem["available_gib"])
+        if where == "auto":
+            # Resident or streamed, a store that does not fit goes to disk: the bytes are the same.
+            # Without a plan to apply (--low-memory off) this function never runs and it stays.
+            where = "memory" if in_memory <= target else "disk"
+            args.revoice_kv_store = where
+        plan.passes["revoice"] = on_disk if where == "disk" else in_memory
         peak = max(plan.passes, key=plan.passes.get)
         plan.peak_pass, plan.peak_gib = peak, plan.passes[peak]
     if plan.mode == "lowmem":
@@ -460,6 +503,7 @@ def plan_for_request(args, device: dict, frames: int, chain: int, window_keyfram
         "peak_gib": plan.peak_gib,
         "vae_batch": plan.vae_batch,
         "stream_vae_decoder": plan.stream_vae_decoder,
+        "revoice_kv_store": getattr(args, "revoice_kv_store", None) if revoice else None,
         "sizes_gib": {k: (round(v, 3) if isinstance(v, float) else v) for k, v in asdict(sizes).items()},
         "machine": mem,
         "admission": admission.as_dict(),

@@ -107,15 +107,15 @@ class PlanTests(unittest.TestCase):
                           available_gib=resident.peak_gib + 0.5)
         self.assertEqual(quiet.mode, "resident")
 
-    def test_decode_ladder_only_steps_down_when_needed(self):
+    def test_decode_ladder_streams_first_and_steps_down_when_needed(self):
+        # A low-memory plan always streams the decoder (the lower peak beats ~2 s on a small Mac);
+        # one tile per call only when the big batch does not fit.
         rows = mp.packed_rows(768, 448, 124, 229)
         roomy = mp.choose(self.sizes, rows, 768, 448, 100.0, vision=False, mode="on")
-        self.assertEqual((roomy.stream_vae_decoder, roomy.vae_batch), (False, 8))
-        tight = mp.choose(self.sizes, rows, 768, 448, roomy.passes["decode"] - 0.01, vision=False, mode="on")
-        self.assertEqual((tight.stream_vae_decoder, tight.vae_batch), (True, 8))
-        self.assertLess(tight.passes["decode"], roomy.passes["decode"])
-        tighter = mp.choose(self.sizes, rows, 768, 448, tight.passes["decode"] - 0.01, vision=False, mode="on")
+        self.assertEqual((roomy.stream_vae_decoder, roomy.vae_batch), (True, 8))
+        tighter = mp.choose(self.sizes, rows, 768, 448, roomy.passes["decode"] - 0.01, vision=False, mode="on")
         self.assertEqual((tighter.stream_vae_decoder, tighter.vae_batch), (True, 1))
+        self.assertLess(tighter.passes["decode"], roomy.passes["decode"])
 
     def test_vae_sizes_split_blocks_from_the_rest(self):
         mib = 1 / 1024
@@ -167,8 +167,65 @@ class PlanTests(unittest.TestCase):
             os.environ.pop("H3_VAE_BATCH", None)
         self.assertEqual(rec["mode"], "lowmem")
         self.assertTrue(args.stream_text_encoder and args.stream_dit and args.dit_pipeline)
-        self.assertEqual(args.cache_gb, 2.0)
-        self.assertEqual(args.decode_cache_gb, 1.0)
+        self.assertEqual(args.cache_gb, mp.LOWMEM_CACHE_GIB)
+        self.assertEqual(args.decode_cache_gb, mp.LOWMEM_DECODE_CACHE_GIB)
+
+
+    def _revoice_args(self, memory_gb, low_memory):
+        return SimpleNamespace(
+            compact_root=self.root / "compact", dit=self.root / "dit", lora=None, width=768,
+            height=448, memory_gb=memory_gb, low_memory=low_memory, reference=None,
+            extend_from=None, lora_qkv_permute=True, lora_fc1_swap=False, revoice_steps=9,
+            revoice_kv="int8", revoice_kv_store="auto", stream_text_encoder=False,
+            stream_dit=False, dit_pipeline=False, cache_gb=None, decode_cache_gb=None)
+
+    def test_revoice_store_goes_to_disk_when_it_does_not_fit(self):
+        # Standard 5 s: the int8 store is ~9 GiB, more than a 16 GB Mac has beside the render.
+        args = self._revoice_args(10.0, "on")
+        env = {"H3_SIMULATE_RAM_GB": "16", "H3_SIMULATE_AVAILABLE_GB": "9"}
+        with mock.patch.dict(os.environ, env):
+            rec = mp.plan_for_request(args, {"max_recommended_working_set_size": 48 * GIB}, 124, 1, [[]], ["p" * 900])
+            os.environ.pop("H3_VAE_BATCH", None)
+        self.assertEqual(rec["mode"], "lowmem")
+        self.assertEqual(args.revoice_kv_store, "disk")
+        self.assertEqual(rec["revoice_kv_store"], "disk")
+        # On disk the pass costs the denoise plus two blocks of the store, not the whole store.
+        self.assertLess(rec["passes_gib"]["revoice"] - rec["passes_gib"]["denoise"], 1.0)
+
+    def test_revoice_store_stays_in_memory_when_it_fits(self):
+        args = self._revoice_args(56.0, "auto")
+        with mock.patch.dict(os.environ, {"H3_SIMULATE_AVAILABLE_GB": "40"}):
+            rec = mp.plan_for_request(args, {"max_recommended_working_set_size": 48 * GIB}, 124, 1, [[]], ["p" * 900])
+        self.assertEqual(rec["mode"], "resident")
+        self.assertEqual(args.revoice_kv_store, "memory")
+        self.assertGreater(rec["passes_gib"]["revoice"] - rec["passes_gib"]["denoise"], 5.0)
+
+    def test_an_explicit_store_choice_is_kept(self):
+        args = self._revoice_args(10.0, "on")
+        args.revoice_kv_store = "memory"
+        with mock.patch.dict(os.environ, {"H3_SIMULATE_RAM_GB": "16", "H3_SIMULATE_AVAILABLE_GB": "9"}):
+            rec = mp.plan_for_request(args, {"max_recommended_working_set_size": 48 * GIB}, 124, 1, [[]], ["p" * 900])
+            os.environ.pop("H3_VAE_BATCH", None)
+        self.assertEqual(args.revoice_kv_store, "memory")
+        self.assertEqual(rec["admission"]["verdict"], "cannot")
+
+
+    def test_a_chain_prices_the_carried_context_encode(self):
+        args = self._revoice_args(10.0, "on")
+        args.revoice_steps = 0
+        with mock.patch.dict(os.environ, {"H3_SIMULATE_RAM_GB": "16", "H3_SIMULATE_AVAILABLE_GB": "10"}):
+            rec = mp.plan_for_request(args, {"max_recommended_working_set_size": 48 * GIB}, 124, 2, [[], []], ["p" * 900])
+            os.environ.pop("H3_VAE_BATCH", None)
+        self.assertIn("media_encode", rec["passes_gib"])
+        self.assertEqual(rec["admission"]["verdict"], "ok")
+        one_call = round((mp.MEDIA_ENCODE_GIB[0] + mp.LOWMEM_CACHE_GIB + mp.RUNTIME_GIB) * mp.MARGIN, 2)
+        self.assertLess(rec["passes_gib"]["media_encode"], one_call)
+        # One clip, no carried frames: the pass does not exist.
+        args2 = self._revoice_args(10.0, "on")
+        args2.revoice_steps = 0
+        rec2 = mp.plan_for_request(args2, {"max_recommended_working_set_size": 48 * GIB}, 124, 1, [[]], ["p" * 900])
+        os.environ.pop("H3_VAE_BATCH", None)
+        self.assertNotIn("media_encode", rec2["passes_gib"])
 
 
 # Real H3 checkpoint sizes (GiB) as the runner reports them in its metrics (Q8 DiT, 17 Nov 2026).

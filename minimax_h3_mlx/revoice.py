@@ -20,6 +20,7 @@ affine 8-bit quantisation per 128-wide head vector.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -120,6 +121,10 @@ class KVStore:
         self.nbytes = 0
 
     def add(self, k: mx.array, v: mx.array) -> None:
+        if k is None:             # a skipped block keeps its slot
+            self.k.append(None)
+            self.v.append(None)
+            return
         if self.mode == "int8":
             pk, pv = _quantize_kv(k), _quantize_kv(v)
             mx.eval(pk[0], pk[1], pk[2], pv[0], pv[1], pv[2])
@@ -136,6 +141,140 @@ class KVStore:
         if self.mode == "int8":
             return _dequantize_kv(k), _dequantize_kv(v)
         return k, v
+
+
+KV_STORES = ("memory", "disk")
+
+
+def _to_numpy(a: mx.array) -> np.ndarray:
+    """The array's exact bytes as numpy (bfloat16 has no numpy dtype: its bits go as uint16)."""
+    if a.dtype == mx.bfloat16:
+        return np.array(a.view(mx.uint16), copy=True)
+    return np.array(a, copy=True)
+
+
+def _from_numpy(n: np.ndarray, dtype) -> mx.array:
+    a = mx.array(n)
+    return a.view(mx.bfloat16) if dtype == mx.bfloat16 else a
+
+
+class DiskKVStore(KVStore):
+    """The same store, kept in a scratch file instead of memory.
+
+    Each block's packed keys and values are written as they are made and read back (the next
+    block's while this one computes) on every audio step. The bytes that come back are the bytes
+    that went in, so a re-voice from this store is identical to one from :class:`KVStore`; what
+    changes is that the process holds two blocks of it, not fifty. A 16 GB Mac cannot hold the
+    whole store (Draft 5 s ~6 GB, Standard ~9 GB at int8) beside the render; it reads ~0.2 GB per
+    block from its SSD instead, which an audio-only step mostly hides.
+    """
+
+    def __init__(self, mode: str, directory=None):
+        import tempfile
+        from concurrent.futures import ThreadPoolExecutor
+
+        super().__init__(mode)
+        # An unnamed file: the OS reclaims it when the process ends, even on a crash.
+        self._fh = tempfile.TemporaryFile(prefix="h3-revoice-kv-", dir=directory)
+        self._fd = self._fh.fileno()
+        self._end = 0
+        self._layout: list = []       # per block: None (skipped) or [(offset, nbytes, np dtype, shape, mx dtype)]
+        self._meta: list = []         # per block: the non-array half of each packed tensor
+        self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="h3-kv-read")
+        self._pending: dict = {}
+        self.bytes_read = 0
+        self.read_wait_seconds = 0.0
+
+    # -- writing ----------------------------------------------------------------------------
+    def _pack(self, t: mx.array):
+        if self.mode == "int8":
+            p = _quantize_kv(t)
+            return list(p[:3]), p[3:]
+        return [t], None
+
+    def add(self, k: mx.array, v: mx.array) -> None:
+        if k is None:
+            self.k.append(None)
+            self.v.append(None)
+            self._layout.append(None)
+            self._meta.append(None)
+            return
+        (ka, km), (va, vm) = self._pack(k), self._pack(v)
+        arrays = ka + va
+        mx.eval(*arrays)
+        entries = []
+        for a in arrays:
+            n = _to_numpy(a)
+            buf = memoryview(n).cast("B")
+            written = 0
+            while written < len(buf):
+                written += os.pwrite(self._fd, buf[written:], self._end + written)
+            entries.append((self._end, n.nbytes, n.dtype, n.shape, a.dtype))
+            self._end += n.nbytes
+            self.nbytes += n.nbytes
+        self._layout.append(entries)
+        self._meta.append((len(ka), km, vm))
+        # Keep only a placeholder, so code that counts blocks still sees fifty.
+        self.k.append(True)
+        self.v.append(True)
+
+    # -- reading ----------------------------------------------------------------------------
+    def _read(self, index: int):
+        out = []
+        for offset, nbytes, ndtype, shape, mdtype in self._layout[index]:
+            n = np.empty(shape, dtype=ndtype)
+            buf = memoryview(n).cast("B")
+            got = 0
+            while got < nbytes:
+                chunk = os.preadv(self._fd, [buf[got:]], offset + got)
+                if chunk <= 0:
+                    raise IOError(f"re-voice store: short read at block {index}")
+                got += chunk
+            out.append((n, mdtype))
+        self.bytes_read += sum(e[1] for e in self._layout[index])
+        return out
+
+    def _next_index(self, index: int):
+        n = len(self._layout)
+        for step in range(1, n + 1):
+            j = (index + step) % n
+            if self._layout[j] is not None:
+                return j
+        return None
+
+    def get(self, index: int) -> tuple[mx.array, mx.array]:
+        import time
+
+        fut = self._pending.pop(index, None)
+        t0 = time.perf_counter()
+        raw = fut.result() if fut is not None else self._read(index)
+        self.read_wait_seconds += time.perf_counter() - t0
+        nxt = self._next_index(index)
+        if nxt is not None and nxt != index and nxt not in self._pending:
+            self._pending[nxt] = self._pool.submit(self._read, nxt)
+        arrays = [_from_numpy(n, d) for n, d in raw]
+        count, km, vm = self._meta[index]
+        if self.mode == "int8":
+            k = _dequantize_kv((*arrays[:3], *km))
+            v = _dequantize_kv((*arrays[3:], *vm))
+            return k, v
+        return arrays[0], arrays[1]
+
+    def close(self) -> None:
+        for fut in self._pending.values():
+            fut.cancel()
+        self._pending.clear()
+        self._pool.shutdown(wait=True)
+        try:
+            self._fh.close()
+        except OSError:
+            pass
+
+
+def make_store(mode: str, where: str = "memory", directory=None) -> KVStore:
+    if where not in KV_STORES:
+        raise ValueError(f"KV store location {where!r}")
+    return DiskKVStore(mode, directory) if where == "disk" else KVStore(mode)
 
 
 def _qkv(attn, h: mx.array, cos: mx.array, sin: mx.array):
@@ -155,7 +294,8 @@ def _attend(attn, q, k, v, dtype) -> mx.array:
     return attn.out_proj(out.astype(dtype))
 
 
-def store_forward(dit, forward_args, modulation_cache, plan: RevoicePlan, kv_mode: str):
+def store_forward(dit, forward_args, modulation_cache, plan: RevoicePlan, kv_mode: str,
+                  store_where: str = "memory", store_dir=None):
     """One exact full forward that also stores every block's K/V for the cached rows.
 
     Returns ``(audio_prediction_rows, store)``; the prediction is the same number ``dit(...)``
@@ -163,13 +303,12 @@ def store_forward(dit, forward_args, modulation_cache, plan: RevoicePlan, kv_mod
     """
     x, temb, adaln_indices, rotary = dit.pack_inputs(*forward_args)
     cos, sin = rotary
-    store = KVStore(kv_mode)
+    store = make_store(kv_mode, store_where, store_dir)
     skip = getattr(dit, "skip_blocks", None) or ()
     streamer = getattr(dit, "streamer", None)
     for i, block in enumerate(dit.blocks):
         if i in skip:
-            store.k.append(None)
-            store.v.append(None)
+            store.add(None, None)
             continue
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation_cache.get(i)
         try:

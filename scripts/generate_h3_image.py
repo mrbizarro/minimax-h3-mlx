@@ -42,6 +42,16 @@ def main(argv=None) -> int:
     ap.add_argument("--no-canvas", action="store_true", help="generate exactly the requested (32-aligned) size")
     ap.add_argument("--reference", action="append", default=[], help="a reference picture (edit); repeatable, Picture 1 first")
     ap.add_argument("--match-reference", action="store_true", help="output in the shape of Picture 1")
+    ap.add_argument("--memory", default="resident", choices=("resident", "auto", "lowmem"),
+                    help="resident = every model held whole (original path); lowmem = text encoder and DiT "
+                         "read from disk as they run; auto = the cheapest setting that fits this Mac")
+    ap.add_argument("--ram-gb", type=float, default=None,
+                    help="plan for a Mac with this much memory (default: this Mac's)")
+    ap.add_argument("--budget-gb", type=float, default=None,
+                    help="with auto: memory this picture may use (the studio passes what is free now)")
+    ap.add_argument("--dit-resident-gb", type=float, default=None,
+                    help="with lowmem: GB of DiT blocks kept in memory (the rest stream)")
+    ap.add_argument("--latents-out", default=None, help="save the final latents (.npy) for exactness checks")
     args = ap.parse_args(argv)
     if not args.prompt.strip():
         raise SystemExit("a prompt is required")
@@ -50,7 +60,7 @@ def main(argv=None) -> int:
 
     from PIL import Image
     from minimax_h3_mlx.h3_image import (DEFAULT_MIN_GENERATION_AREA, MAX_REFERENCES, H3ImageRunner,
-                                         load_reference, size_for_megapixels, size_matching)
+                                         load_reference, memory_settings, size_for_megapixels, size_matching)
 
     if len(args.reference) > MAX_REFERENCES:
         raise SystemExit(f"at most {MAX_REFERENCES} reference pictures")
@@ -63,7 +73,11 @@ def main(argv=None) -> int:
         width, height = size_matching(references[0], args.mp)
     else:
         width, height = size_for_megapixels(args.aspect, args.mp)
-    runner = H3ImageRunner(args.root, args.text_dir, args.text_config)
+    memory = memory_settings(args.memory, width * height / (1024 * 1024), [r.size for r in references],
+                             ram_gib=args.ram_gb, dit_resident_gb=args.dit_resident_gb,
+                             budget_gib=args.budget_gb)
+    print(f"memory setting: {memory.name}", flush=True)
+    runner = H3ImageRunner(args.root, args.text_dir, args.text_config, memory=memory)
     started = time.perf_counter()
     image = runner.generate(args.prompt, width, height, seed=args.seed,
                             min_generation_area=None if args.no_canvas else DEFAULT_MIN_GENERATION_AREA,
@@ -71,6 +85,10 @@ def main(argv=None) -> int:
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(image).save(out)
+    if args.latents_out:
+        import numpy as np
+
+        np.save(args.latents_out, np.array(runner.last_latents))
     runner.metrics.update({"width": width, "height": height, "seed": args.seed, "prompt": args.prompt,
                            "reference_paths": list(args.reference),
                            "output": str(out), "request_seconds": time.perf_counter() - started})

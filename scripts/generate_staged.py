@@ -245,7 +245,10 @@ def load_encode_vae(args):
     """The video VAE for an encode (keyframes, references, carried frames). Low-memory renders
     load only its CNN encoder: the 4.5 GiB ViT decoder is never run by an encode."""
     path = args.compact_root / "video_vae.safetensors"
-    if getattr(args, "stream_vae_decoder", False):
+    # Any low-memory render (not only one that streams its decoder): when the plan keeps the
+    # decoder resident for the decode, an encode still has no use for it, and loading it made a
+    # chain's second window peak at ~13 GB on a 16 GB plan (12.1 GiB MLX in media_encode).
+    if getattr(args, "stream_vae_decoder", False) or getattr(args, "stream_dit", False):
         from minimax_h3_mlx.vae_stream import load_compact_video_vae_encoder_only
 
         return load_compact_video_vae_encoder_only(path)
@@ -899,7 +902,10 @@ def run_revoice(args, record, label, dit, rv, layout, video_rows, audio_rows, em
                 _, audio_out = dit(*forward_args, modulation_cache=rv["cache"])
                 pred = audio_out[0].astype(mx.float32)
             elif store is None:
-                audio_out, store = mod.store_forward(dit, forward_args, rv["cache"], rv["rows"], kv)
+                audio_out, store = mod.store_forward(
+                    dit, forward_args, rv["cache"], rv["rows"], kv,
+                    store_where=getattr(args, "revoice_kv_store", "memory") or "memory",
+                    store_dir=args.output.parent)
                 pred = audio_out[0].astype(mx.float32)
                 rotary = dit.rope(layout.position_ids)
             else:
@@ -917,7 +923,13 @@ def run_revoice(args, record, label, dit, rv, layout, video_rows, audio_rows, em
             print(f"re-voice step {index + 1}/{rv['forwards']}: {step_seconds[-1]:.2f}s "
                   f"(active {gb(mx.get_active_memory()):.1f} GiB)", flush=True)
         mod.set_adapter_scales(dit, rv["drop"], None)
+        disk = getattr(store, "bytes_read", None) is not None
+        if disk:
+            store.close()
         record.data[f"{label}revoice"] = {
+            "kv_store": "disk" if disk else "memory",
+            "kv_read_gib": round(gb(store.bytes_read), 2) if disk else 0.0,
+            "kv_read_wait_seconds": round(store.read_wait_seconds, 3) if disk else 0.0,
             "steps": int(rv["forwards"]) + 1,
             "forwards": int(rv["forwards"]),
             "kv": kv,
@@ -2053,6 +2065,25 @@ def main() -> int:
         "memory of bf16), bf16, or off = run the exact full forward on every audio step (slow).",
     )
     parser.add_argument(
+        "--vae-encode-chunk",
+        type=int,
+        default=None,
+        metavar="FRAMES",
+        help="Compute each video-encoder convolution FRAMES output frames at a time (0 = all at "
+        "once). The encoder is causal and normalises per frame, so the latents are bit-identical; "
+        "a carried 17-frame context then needs half the memory. Default: 5 on a low-memory plan, "
+        "else 0. Below 5, MLX 0.32 picks another convolution kernel and the latents change.",
+    )
+    parser.add_argument(
+        "--revoice-kv-store",
+        choices=("auto", "memory", "disk"),
+        default="auto",
+        help="Where that store lives: memory, or disk = a scratch file beside the output, read "
+        "back a block at a time on every audio step (the same bytes, so the same sound; two "
+        "blocks in memory instead of fifty). auto (default): memory, unless --low-memory decides "
+        "the store does not fit beside the render.",
+    )
+    parser.add_argument(
         "--revoice-strength",
         type=float,
         default=1.0,
@@ -2618,6 +2649,20 @@ def main() -> int:
             return {"ok": 0, "cannot": EXIT_CANNOT, "busy": EXIT_BUSY}[verdict]
         if verdict != "ok":
             return EXIT_CANNOT if verdict == "cannot" else EXIT_BUSY
+    from minimax_h3_mlx.memory_plan import LOWMEM_ENCODE_CHUNK
+
+    if args.vae_encode_chunk is None:
+        # Low-memory renders slice the encoder's convolutions in time (bit-identical latents);
+        # everything else keeps the one-call encode.
+        args.vae_encode_chunk = (LOWMEM_ENCODE_CHUNK
+                                 if (memory_plan is not None and memory_plan["mode"] == "lowmem") else 0)
+    if args.vae_encode_chunk:
+        from minimax_h3_mlx.video_vae import set_conv_time_chunk
+
+        set_conv_time_chunk(args.vae_encode_chunk)
+    if getattr(args, "revoice_kv_store", "auto") == "auto":
+        # Without a memory plan nothing decides otherwise: the store stays in memory, as before.
+        args.revoice_kv_store = "memory"
     max_wired = int(device["max_recommended_working_set_size"])
     wired_bytes = min(int(args.wired_gb * 1024**3), max_wired - 1024**2)
     memory_bytes = min(int(args.memory_gb * 1024**3), int(device["memory_size"]) - 1024**3)
@@ -2708,6 +2753,7 @@ def main() -> int:
         "decode_cache_limit_gb": args.decode_cache_gb,
         "low_memory": args.low_memory,
         "stream_vae_decoder": bool(getattr(args, "stream_vae_decoder", False)),
+        "vae_encode_chunk": int(getattr(args, "vae_encode_chunk", 0) or 0),
         "memory_plan": memory_plan,
         "wired_gb": round(gb(wired_bytes), 3),
         "memory_limit_gb": round(gb(memory_bytes), 3),

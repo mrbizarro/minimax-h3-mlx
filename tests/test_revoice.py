@@ -143,6 +143,51 @@ def test_kv_estimate():
     assert bf16 == 2 * 1000 * 7168 * 50 * 2 and int8 < bf16 * 0.6
 
 
+def _bits(a):
+    a = mx.array(a)
+    return np.array(a.view(mx.uint16)) if a.dtype == mx.bfloat16 else np.array(a)
+
+
+def test_disk_store_returns_the_same_bytes_as_the_memory_store():
+    # The store on disk must hand back exactly what the memory store holds, block by block and
+    # on every pass (each audio step reads all fifty blocks again), so the sound is the same.
+    for mode in ("int8", "bf16"):
+        for dtype in (mx.bfloat16, mx.float32):
+            mx.random.seed(7)
+            mem, disk = revoice.KVStore(mode), revoice.DiskKVStore(mode)
+            blocks = []
+            for i in range(5):
+                if i == 2:
+                    mem.add(None, None); disk.add(None, None); blocks.append(None); continue
+                k = mx.random.normal((1, 2, 33, 128)).astype(dtype)
+                v = mx.random.normal((1, 2, 33, 128)).astype(dtype)
+                mem.add(k, v); disk.add(k, v); blocks.append((k, v))
+            assert disk.nbytes == mem.nbytes and len(disk.k) == len(mem.k) == 5
+            for _ in range(3):
+                for i, kv in enumerate(blocks):
+                    if kv is None:
+                        continue
+                    (mk, mv), (dk, dv) = mem.get(i), disk.get(i)
+                    assert dk.dtype == mk.dtype and dk.shape == mk.shape
+                    assert np.array_equal(_bits(dk), _bits(mk)) and np.array_equal(_bits(dv), _bits(mv))
+            assert disk.bytes_read >= 3 * disk.nbytes   # plus the block read ahead
+            disk.close()
+
+
+def test_store_forward_on_disk_gives_the_same_audio_forward():
+    dit, layout, cache, args = _setup()
+    plan = revoice.plan_rows(layout)
+    for mode in ("int8", "bf16"):
+        a_mem, s_mem = revoice.store_forward(dit, args, cache, plan, mode)
+        a_disk, s_disk = revoice.store_forward(dit, args, cache, plan, mode, store_where="disk")
+        assert np.array_equal(np.array(a_mem), np.array(a_disk))
+        rows = args[1][0] * 0.5
+        got_mem = _audio_only(dit, layout, cache, args, s_mem, rows)
+        got_disk = _audio_only(dit, layout, cache, args, s_disk, rows)
+        assert np.array_equal(np.array(got_mem), np.array(got_disk))
+        s_disk.close()
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

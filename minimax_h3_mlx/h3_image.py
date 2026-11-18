@@ -19,6 +19,7 @@ from __future__ import annotations
 import gc
 import json
 import time
+from dataclasses import asdict, dataclass
 from math import sqrt
 from pathlib import Path
 
@@ -135,10 +136,12 @@ def load_reference(path) -> "object":
     return image
 
 
-def vae_reference(image):
-    """The VAE's copy of a reference: bounded to a 1024-2048 px short edge, then cropped top-left to
-    an even 16 px grid. Returns ``(pixels, (latent_h, latent_w))``."""
-    bounded = bound_reference(image, *VAE_SHORT_EDGE)
+def vae_reference(image, short_edge: int | None = None):
+    """The VAE's copy of a reference: bounded to a 1024-2048 px short edge (or exactly
+    ``short_edge``, the light-references memory setting), then cropped top-left to an even 16 px
+    grid. Returns ``(pixels, (latent_h, latent_w))``."""
+    bounds = (short_edge, short_edge) if short_edge else VAE_SHORT_EDGE
+    bounded = bound_reference(image, *bounds)
     gh, gw = reference_grid(*bounded.size)
     if (gw * 16, gh * 16) != bounded.size:
         bounded = bounded.crop((0, 0, gw * 16, gh * 16))
@@ -293,6 +296,267 @@ def denoise_h3_image(
     return unpatchify_video_tokens(video_rows, 1, lh, lw, latent_channels, patch)
 
 
+def process_footprint() -> int:
+    """This process's physical footprint in bytes (what macOS's memory killer reads), or 0."""
+    try:
+        import ctypes
+        import os
+
+        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        buf = ctypes.create_string_buffer(512)
+        if libc.proc_pid_rusage(os.getpid(), 2, buf) != 0:      # RUSAGE_INFO_V2
+            return 0
+        return int.from_bytes(buf.raw[72:80], "little")          # ri_phys_footprint
+    except Exception:
+        return 0
+
+
+class _PhaseMeter:
+    """Wall time, MLX peak and the highest process footprint of each phase of one picture.
+
+    A 20 Hz sampler thread reads the footprint, because MLX's own peak does not count the page
+    cache, the interpreter or the Metal driver, and jetsam acts on the footprint.
+    """
+
+    def __init__(self):
+        import threading
+
+        self.phases: dict = {}
+        self._name, self._fp, self._t = None, 0, 0.0
+        self._overall = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._sample, daemon=True)
+        self._thread.start()
+
+    def _sample(self):
+        while not self._stop.is_set():
+            fp = process_footprint()
+            if fp > self._fp:
+                self._fp = fp
+            if fp > self._overall:
+                self._overall = fp
+            self._stop.wait(0.05)
+
+    def begin(self, name: str):
+        mx.synchronize()
+        mx.reset_peak_memory()
+        self._name, self._fp, self._t = name, process_footprint(), time.perf_counter()
+
+    def end(self):
+        mx.synchronize()
+        fp = max(self._fp, process_footprint())
+        self._overall = max(self._overall, fp)
+        self.phases[self._name] = {"seconds": round(time.perf_counter() - self._t, 2),
+                                   "mlx_peak_gb": round(mx.get_peak_memory() / 1e9, 2),
+                                   "footprint_gb": round(fp / 1e9, 2)}
+
+    def close(self) -> dict:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        return {"phases": self.phases, "peak_footprint_gb": round(self._overall / 1e9, 2),
+                "peak_mlx_gb": max((p["mlx_peak_gb"] for p in self.phases.values()), default=0.0)}
+
+
+@dataclass(frozen=True)
+class MemorySettings:
+    """How one picture holds its weights. The default is the original, fully resident path.
+
+    ``stream_text_encoder``: the Qwen3-VL encoder is read one decoder layer at a time (with the
+    next layer read ahead), never resident as a whole. ``stream_dit``: the DiT's block linears are
+    read per block during each forward (:mod:`dit_stream`), except the first ``dit_resident_gb``
+    worth of blocks, which stay resident. ``cache_gb``: MLX's buffer-cache cap (None = MLX's own).
+    ``decode_batch``: decoder tiles per call. Streaming moves evaluation boundaries only: the same
+    bytes go through the same kernels, so the picture is the same (``tests/test_h3_image_lowmem``
+    and the bench record the sha of both).
+    """
+
+    stream_text_encoder: bool = False
+    stream_dit: bool = False
+    dit_resident_gb: float = 0.0
+    cache_gb: float | None = None
+    decode_batch: int = 8
+    name: str = "resident"
+    #: The VAE copy of each edit reference is bounded to this short edge instead of the release's
+    #: 1024-2048 px (None). 1024 is the release's own lower bound; a smaller copy means fewer rows
+    #: in every forward, so less memory and a faster edit, at a measured cost in fidelity to the
+    #: references. It is the only lossy setting: ``auto`` takes it only when nothing exact fits.
+    reference_short_edge: int | None = None
+
+    @property
+    def lowmem(self) -> bool:
+        return self.stream_text_encoder or self.stream_dit
+
+
+RESIDENT = MemorySettings()
+
+#: Measured peak footprint (GiB) of each phase on the resident path and per streamed setting; see
+#: ``plan_memory``. Filled from the bench (M4 Max 64 GB, mlx 0.32.4) and inflated by MARGIN.
+MEMORY_MARGIN = 1.10
+
+
+def mac_budget_gib(ram_gib: float) -> float:
+    """What a render may use on a Mac with ``ram_gib``: the studio's H3 rule (RAM less the larger of
+    6 GB and an eighth of RAM, which macOS and an open browser keep)."""
+    return float(ram_gib) - max(6.0, float(ram_gib) / 8.0)
+
+
+# --- calibration: peak process footprint per phase, GiB (measured) -------------------------------
+#: Measured, M4 Max 64 GB, mlx 0.32.4, 12 Nov 2026 (footprint of the largest phase):
+#:   resident  4 MP: text 27.96 / denoise 23.54 / decode 4.84   16 MP: 27.98 / 27.99 / 6.21
+#:   streamed  4 MP: text  1.88 / denoise  4.83 / decode 4.14   16 MP:  1.88 /  8.15 / 4.58
+#:   streamed with 12 GB of blocks resident, 4 MP: denoise 17.53, same wall time (99.3 s).
+#: Latents and pixels were byte-identical across all three at each size.
+#: Resident text encoder (Qwen3-VL-32B truncated to 50 layers, Q8) and with the vision tower.
+TEXT_RESIDENT_GIB = 28.0
+TEXT_VISION_EXTRA_GIB = 1.0
+#: Streamed text encoder: one decoder layer, the one read ahead, and the hidden states.
+TEXT_STREAMED_GIB = 2.0
+#: The DiT: everything outside the 50 blocks, and one block's streamed linears.
+DIT_NONBLOCK_GIB = 0.8
+DIT_BLOCK_GIB = 0.38
+DIT_BLOCKS = 50
+#: Streamed DiT holds three block slots (computing, queued, being read).
+DIT_SLOTS = 3
+#: Denoise working memory per 1,000 packed rows (attention projections, SwiGLU, residual).
+#: Fitted 13 Nov over 16.9k rows (16 MP, 3.41 GiB of work), 25.1k (24 MP, 5.13) and 47.7k (the
+#: six-reference edit, 10.34): 0.20-0.22 per 1,000, attention growing a little faster than the
+#: rows. 0.20 with :data:`MEMORY_MARGIN` covers all three (the 0.185 of 12 Nov fell short on
+#: the edit: 13.9 estimated, 14.08 measured).
+DENOISE_GIB_PER_KROW = 0.20
+#: Process outside MLX's counters (interpreter, driver, libraries).
+RUNTIME_GIB = 0.8
+#: Decoder weights and its working memory per megapixel at a batch of 8 / 1 tiles.
+DECODE_WEIGHTS_GIB = 1.2
+DECODE_GIB_PER_MP = {8: 0.25, 1: 0.12}
+
+
+#: A reference whose size is not known yet is priced as the largest the release takes: a 16:9
+#: picture at the 2048 px short edge (2048x3648 for the VAE, 1024x1824 for the text encoder).
+WORST_REFERENCE = (3648, 2048)
+#: Text rows outside the references (the prompt and its template).
+TEXT_BASE_ROWS = 512
+
+
+def _reference_sizes(references) -> list[tuple[int, int]]:
+    if isinstance(references, int):
+        return [WORST_REFERENCE] * references
+    return [(int(w), int(h)) for w, h in (references or [])]
+
+
+def _bounded(size: tuple[int, int], low: int, high: int) -> tuple[int, int]:
+    return bounded_reference_size(size[0], size[1], low, high) or size
+
+
+def reference_rows(references, reference_short_edge: int | None = None) -> tuple[int, int]:
+    """``(vae_rows, vision_rows)`` the references add: each one's VAE copy (one row per 32x32 px
+    of its 1024-2048 px short-edge copy, or of its ``reference_short_edge`` copy) and its 1024 px
+    vision copy in the text (about one row per 32x32 px too). ``references`` is a count (priced as
+    :data:`WORST_REFERENCE`) or the pictures' ``(width, height)``. Measured 13 Nov, six pictures:
+    33,878 reference rows and 9,751 text rows."""
+    bounds = (reference_short_edge, reference_short_edge) if reference_short_edge else VAE_SHORT_EDGE
+    vae = vision = 0
+    for size in _reference_sizes(references):
+        w, h = _bounded(size, *bounds)
+        vae += (w // 32) * (h // 32)
+        qw, qh = _bounded(size, *QWEN_SHORT_EDGE)
+        vision += int(qw * qh / 1024) + 16
+    return vae, vision
+
+
+def packed_rows_estimate(megapixels: float, references=0, text_rows: int = TEXT_BASE_ROWS,
+                         reference_short_edge: int | None = None) -> int:
+    """Rows the DiT carries: the target (one per 32x32 px), the references and the text."""
+    vae, vision = reference_rows(references, reference_short_edge)
+    return int(megapixels * 1024 + vae + text_rows + vision)
+
+
+def estimate_peak_gib(settings: MemorySettings, megapixels: float, references=0) -> float:
+    """Estimated peak footprint (GiB, margin included) of the largest phase under ``settings``.
+    ``references``: a count or the pictures' ``(width, height)`` (see :func:`reference_rows`)."""
+    sizes = _reference_sizes(references)
+    text = TEXT_STREAMED_GIB if settings.stream_text_encoder else TEXT_RESIDENT_GIB
+    if sizes:
+        # The vision tower plus the hidden states of the vision rows (six pictures: 6.15 GB streamed).
+        _, vision = reference_rows(sizes)
+        text += (TEXT_VISION_EXTRA_GIB if not settings.stream_text_encoder else 0.5) + 0.35 * vision / 1000.0
+    work = DENOISE_GIB_PER_KROW * packed_rows_estimate(
+        megapixels, sizes, reference_short_edge=settings.reference_short_edge) / 1000.0
+    if settings.stream_dit:
+        kept = min(DIT_BLOCKS, int(settings.dit_resident_gb // DIT_BLOCK_GIB)) if settings.dit_resident_gb else 0
+        weights = DIT_NONBLOCK_GIB + kept * DIT_BLOCK_GIB + DIT_SLOTS * DIT_BLOCK_GIB
+    else:
+        weights = DIT_NONBLOCK_GIB + DIT_BLOCKS * DIT_BLOCK_GIB
+    cache = settings.cache_gb or 0.0
+    denoise = weights + work + cache
+    batch = 1 if settings.decode_batch <= 1 else 8
+    decode = DECODE_WEIGHTS_GIB + DECODE_GIB_PER_MP[batch] * megapixels + min(cache, 1.0)
+    return round((max(text, denoise, decode) + RUNTIME_GIB) * MEMORY_MARGIN, 2)
+
+
+LOWMEM = MemorySettings(stream_text_encoder=True, stream_dit=True, cache_gb=2.0, name="lowmem")
+LOWMEM_MIN = MemorySettings(stream_text_encoder=True, stream_dit=True, cache_gb=1.0, decode_batch=1,
+                            name="lowmem-min")
+#: The one lossy rung, edits only: references copied at the release's lower bound (1024 px short
+#: edge) instead of up to 2048 px. A six-picture edit carries about 48,000 rows at full size and
+#: about 23,000 here.
+LOWMEM_LIGHTREF = MemorySettings(stream_text_encoder=True, stream_dit=True, cache_gb=1.0, decode_batch=1,
+                                 name="lowmem-lightref", reference_short_edge=1024)
+
+
+def memory_ladder(megapixels: float, references: int = 0) -> list[MemorySettings]:
+    """The settings ``auto`` picks from, first fitting wins.
+
+    The resident path is not on it: streaming was measured as fast or faster at every size (the
+    reads hide under each block's compute, and nothing big is loaded up front: 4 MP 99 s vs 107 s,
+    16 MP 525 s vs 528 s), byte-identical, at a third or less of the memory. Keeping blocks
+    resident bought no time either (12 GB resident: 99.3 s, the same). ``resident`` stays an
+    explicit choice. An edit gets one more rung, :data:`LOWMEM_LIGHTREF`, the only lossy one."""
+    if _reference_sizes(references):
+        return [LOWMEM, LOWMEM_MIN, LOWMEM_LIGHTREF]
+    return [LOWMEM, LOWMEM_MIN]
+
+
+def machine_ram_gib() -> float:
+    import subprocess
+
+    try:
+        return int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True).stdout) / 1024**3
+    except Exception:
+        return 0.0
+
+
+def memory_settings(mode: str, megapixels: float, references=0, ram_gib: float | None = None,
+                    dit_resident_gb: float | None = None, budget_gib: float | None = None) -> MemorySettings:
+    """``resident`` | ``lowmem`` | ``auto`` (the fastest rung that fits ``ram_gib``, default this
+    Mac, and ``budget_gib`` if given)."""
+    if mode == "resident":
+        return RESIDENT
+    if mode == "lowmem":
+        settings = LOWMEM
+    elif mode == "auto":
+        settings = plan_memory(ram_gib or machine_ram_gib(), megapixels, references, budget_gib)
+    else:
+        raise ValueError(f"unknown memory mode {mode!r}")
+    if dit_resident_gb is not None and settings.stream_dit:
+        settings = MemorySettings(settings.stream_text_encoder, True, float(dit_resident_gb), settings.cache_gb,
+                                  settings.decode_batch, f"{settings.name}@{dit_resident_gb:g}",
+                                  settings.reference_short_edge)
+    return settings
+
+
+def plan_memory(ram_gib: float, megapixels: float, references=0,
+                budget_gib: float | None = None) -> MemorySettings:
+    """The fastest rung of :func:`memory_ladder` whose largest phase fits the budget: a Mac's
+    (:func:`mac_budget_gib`), or ``budget_gib`` when the caller knows what is free right now."""
+    budget = mac_budget_gib(ram_gib) if budget_gib is None else float(budget_gib)
+    if ram_gib and budget_gib is not None:
+        budget = min(budget, mac_budget_gib(ram_gib))
+    for settings in memory_ladder(megapixels, references):
+        if estimate_peak_gib(settings, megapixels, references) <= budget:
+            return settings
+    return memory_ladder(megapixels, references)[-1]
+
+
 class H3ImageRunner:
     """Staged driver: text encoder out before the DiT comes in, DiT out before the decoder.
 
@@ -302,10 +566,11 @@ class H3ImageRunner:
     """
 
     def __init__(self, root: str | Path, text_dir: str | Path, text_config: str | Path | None = None,
-                 compile_blocks: bool = False):
+                 compile_blocks: bool = False, memory: MemorySettings = RESIDENT):
         self.root, self.text_dir = Path(root), Path(text_dir)
         self.text_config = Path(text_config) if text_config else None
         self.compile_blocks = compile_blocks
+        self.memory = memory
         self.metrics: dict = {}
 
     def close(self):
@@ -316,21 +581,43 @@ class H3ImageRunner:
                  min_generation_area: int | None = DEFAULT_MIN_GENERATION_AREA,
                  references: list | None = None) -> np.ndarray:
         """Text to image, or an edit when ``references`` (PIL RGB pictures, Picture 1 first) are given."""
+        references = list(references or [])
+        if len(references) > MAX_REFERENCES:
+            raise ValueError(f"MiniMax-H3-Image takes at most {MAX_REFERENCES} reference pictures, got {len(references)}")
+        mem = self.memory
+        m = self.metrics = {"compile_blocks": self.compile_blocks, "references": len(references),
+                            "memory": asdict(mem)}
+        t0 = time.perf_counter()
+        cw, ch = generation_canvas(width, height, min_generation_area)
+        m["canvas"] = [cw, ch]
+        meter = _PhaseMeter()
+        previous_cache = None
+        if mem.cache_gb is not None:
+            previous_cache = mx.set_cache_limit(int(mem.cache_gb * 1024**3))
+
+        try:
+            image = self._generate(prompt, width, height, cw, ch, seed, verbose, references, meter, m)
+        finally:
+            m.update(meter.close())
+            if previous_cache is not None:
+                mx.set_cache_limit(previous_cache)
+        m["total_seconds"] = time.perf_counter() - t0
+        m["peak_gb"] = m["peak_mlx_gb"]
+        if verbose:
+            parts = ", ".join("%s %.1f" % (k, v["footprint_gb"]) for k, v in m["phases"].items())
+            print("memory: %s, peak footprint %.1f GB (%s)" % (mem.name, m["peak_footprint_gb"], parts), flush=True)
+        return image
+
+    def _generate(self, prompt, width, height, cw, ch, seed, verbose, references, meter, m):
         from .h3_image_vae import decode_to_uint8, load_h3_image_vae, load_h3_image_vae_encoder
         from .load import load_dit
         from .text_encoder import MiniMaxH3TextEncoder
 
-        references = list(references or [])
-        if len(references) > MAX_REFERENCES:
-            raise ValueError(f"MiniMax-H3-Image takes at most {MAX_REFERENCES} reference pictures, got {len(references)}")
-        m = self.metrics = {"compile_blocks": self.compile_blocks, "references": len(references)}
-        t0 = time.perf_counter()
-        cw, ch = generation_canvas(width, height, min_generation_area)
-        m["canvas"] = [cw, ch]
-
+        mem = self.memory
+        meter.begin("text")
         started = time.perf_counter()
         encoder = MiniMaxH3TextEncoder(self.text_dir, load_vision=bool(references), verbose=False,
-                                       config_path=self.text_config)
+                                       config_path=self.text_config, stream=mem.stream_text_encoder)
         if references:
             qwen_images = [bound_reference(img, *QWEN_SHORT_EDGE) for img in references]
             cond, tags = encoder.encode(prompt, qwen_images, label_format=EDIT_LABEL)
@@ -338,18 +625,22 @@ class H3ImageRunner:
             cond, tags = encoder.encode(prompt)
         mx.eval(cond)
         m["text_seconds"], m["text_rows"] = time.perf_counter() - started, int(cond.shape[1])
+        if getattr(encoder, "stream_stats", None):
+            m["text_stream"] = dict(encoder.stream_stats)
         del encoder
         gc.collect()
         mx.clear_cache()
+        meter.end()
 
         reference_rows, grids = None, ()
         if references:
+            meter.begin("reference")
             started = time.perf_counter()
             vae_json = json.loads((self.root / "vae" / "config.json").read_text())
             enc = load_h3_image_vae_encoder(self.root / "vae" / "diffusion_pytorch_model.safetensors", vae_json)
             parts, grid_list = [], []
             for index, img in enumerate(references):
-                pixels, grid = vae_reference(img)
+                pixels, grid = vae_reference(img, mem.reference_short_edge)
                 parts.append(encode_reference_rows(enc, pixels, (1, 2, 2), seed, index))
                 grid_list.append(grid)
             reference_rows = parts[0] if len(parts) == 1 else mx.concatenate(parts)
@@ -363,9 +654,16 @@ class H3ImageRunner:
             del enc
             gc.collect()
             mx.clear_cache()
+            meter.end()
 
+        meter.begin("denoise")
         started = time.perf_counter()
-        dit = load_dit(self.root / "dit", verbose=verbose)
+        stream = None
+        if mem.stream_dit:
+            from .dit_stream import StreamPolicy
+
+            stream = StreamPolicy(resident_gb=mem.dit_resident_gb or None, pipeline=True)
+        dit = load_dit(self.root / "dit", verbose=verbose, stream=stream)
         cache = load_modulation_cache(self.root / "dit" / "adaln_cache.safetensors")
         heads = load_pdd_heads(self.root / "pdd_fused_heads.safetensors")
         dit.compile_image_blocks = self.compile_blocks
@@ -378,15 +676,25 @@ class H3ImageRunner:
         m["denoise_seconds"] = time.perf_counter() - started
         m["step_seconds"] = list(getattr(denoise_h3_image, "last_step_seconds", []))
         m["forwards"] = len(m["step_seconds"])
-        del dit, cache, reference_rows
+        streamer = getattr(dit, "streamer", None)
+        if streamer is not None:
+            m["dit_stream"] = streamer.summary()
+            streamer.close()
+        self.last_latents = latents
+        del dit, cache, reference_rows, streamer
         gc.collect()
         mx.clear_cache()
+        meter.end()
 
+        meter.begin("decode")
         started = time.perf_counter()
         vae = load_h3_image_vae(self.root / "vae" / "diffusion_pytorch_model.safetensors",
                                 json.loads((self.root / "vae" / "config.json").read_text()))
+        vae.decode_batch = max(1, int(mem.decode_batch))
         image = resize_output(decode_to_uint8(vae, latents), width, height)
+        del vae
+        gc.collect()
+        mx.clear_cache()
         m["decode_seconds"] = time.perf_counter() - started
-        m["total_seconds"] = time.perf_counter() - t0
-        m["peak_gb"] = mx.get_peak_memory() / 1e9
+        meter.end()
         return image

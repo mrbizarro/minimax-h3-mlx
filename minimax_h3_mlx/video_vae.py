@@ -155,6 +155,28 @@ def single_frame_conv2d() -> bool:
     return os.environ.get("H3_VAE_ENCODER_CONV2D", "0") == "1"
 
 
+#: Output frames one 3D convolution computes per call (0 = all at once). See set_conv_time_chunk.
+_CONV_TIME_CHUNK = int(os.environ.get("H3_VAE_CONV_TIME_CHUNK", "0") or 0)
+
+
+def set_conv_time_chunk(frames: int) -> None:
+    """Compute each encoder convolution's output a few frames at a time.
+
+    The encoder is causal in time (an output frame reads its own input frame and the ones before
+    it) and every norm is per frame, so a convolution's output frames can be made in slices from
+    the input frames each slice reads. Each output value is the same dot product over the same
+    inputs, only fewer of them are in flight: a 17-frame carried context at 640x384 peaked at
+    ~11 GiB because one call over every frame unfolds every frame at once.
+
+    Bit-identical only from 5 frames per call up on the real weights (mlx 0.32.4): below that
+    MLX picks a different convolution kernel and the sums are taken in another order. The
+    low-memory plan uses 5 (memory_plan.LOWMEM_ENCODE_CHUNK); tests/test_vae_encode_chunk.py
+    holds the tiny model to it, and a real-weight sha256 check is in the commit that set it.
+    """
+    global _CONV_TIME_CHUNK
+    _CONV_TIME_CHUNK = max(0, int(frames))
+
+
 def reflect_pad(x: mx.array, axis: int, left: int, right: int) -> mx.array:
     """Reflect padding without repeating the edge element, matching ``F.pad(mode="reflect")``.
 
@@ -216,7 +238,20 @@ class CausalConv3d(nn.Module):
             return out
         if self.temporal_padding > 0:
             x = mx.pad(x, ((0, 0), (self.temporal_padding, 0), (0, 0), (0, 0), (0, 0)))
-        out = mx.conv3d(x, self.weight, stride=self.stride, padding=0)
+        kd, sd = self.weight.shape[1], self.stride[0]
+        frames_out = (x.shape[1] - kd) // sd + 1
+        chunk = _CONV_TIME_CHUNK
+        if chunk and frames_out > chunk:
+            parts = []
+            for t0 in range(0, frames_out, chunk):
+                t1 = min(frames_out, t0 + chunk)
+                part = mx.conv3d(x[:, t0 * sd : (t1 - 1) * sd + kd], self.weight,
+                                 stride=self.stride, padding=0)
+                mx.eval(part)
+                parts.append(part)
+            out = mx.concatenate(parts, axis=1)
+        else:
+            out = mx.conv3d(x, self.weight, stride=self.stride, padding=0)
         if "bias" in self:
             out = out + self.bias
         return out
